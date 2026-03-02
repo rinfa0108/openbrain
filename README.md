@@ -736,3 +736,6 @@ OpenBrain runs as a **local-first service**:
 ## License
 
 Apache-2.0 (recommended for wide adoption) or MIT.
+
+Digilabs Company Australia © NYEX AI Platform. All rights reserved.
+AIC Pty Ltd (ACN 082 378 256)
