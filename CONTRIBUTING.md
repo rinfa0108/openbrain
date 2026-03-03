@@ -37,7 +37,7 @@ Example (Docker):
 - Optional env:
   - `OPENBRAIN_BIND=127.0.0.1` (default)
   - `OPENBRAIN_PORT=7981` (default)
-  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai` (default: `noop`)
+  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai|local` (default: `noop`)
 
 Run from repo root:
 
@@ -84,7 +84,7 @@ Minimal examples (adjust `scope`/`id`):
 - Required env:
   - `DATABASE_URL=postgres://...`
 - Optional env:
-  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai` (default: `noop`)
+  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai|local` (default: `noop`)
 
 Run from repo root:
 
@@ -118,6 +118,31 @@ Optional:
 Live OpenAI tests are opt-in only:
 
 - set `RUN_OPENAI_LIVE_TESTS=1` and `OPENAI_API_KEY` to run `crates/openbrain-embed/tests/openai_live.rs`
+
+## Local HTTP embeddings provider (IT7C)
+
+Enable local embeddings without external keys:
+
+- `OPENBRAIN_EMBED_PROVIDER=local`
+- `LOCAL_EMBED_URL=http://127.0.0.1:8080/embeddings` (required)
+
+Optional:
+
+- `LOCAL_EMBED_MODEL`
+- `LOCAL_EMBED_TIMEOUT_SECS`
+- `LOCAL_EMBED_HEADER_*` (e.g., `LOCAL_EMBED_HEADER_AUTHORIZATION=Bearer ...`)
+
+Expected JSON contract (v0.1):
+
+Request:
+```json
+{ "model": "optional-model", "input": "text..." }
+```
+
+Response:
+```json
+{ "data": [ { "embedding": [0.01, 0.02, "..."] } ] }
+```
 
 ## Claude rerank + memory pack (IT7B)
 
