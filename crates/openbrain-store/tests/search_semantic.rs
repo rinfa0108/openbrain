@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use openbrain_core::textnorm::normalize_object_text;
 use openbrain_core::{Envelope, MemoryObject};
 use openbrain_embed::{EmbedError, EmbeddingProvider, FakeEmbeddingProvider};
@@ -293,8 +294,9 @@ async fn semantic_search_rejects_invalid_filter() {
 #[derive(Debug)]
 struct BadDimsProvider;
 
+#[async_trait]
 impl EmbeddingProvider for BadDimsProvider {
-    fn embed(&self, _model: &str, _text: &str) -> Result<Vec<f32>, EmbedError> {
+    async fn embed(&self, _model: &str, _text: &str) -> Result<Vec<f32>, EmbedError> {
         Ok(vec![0.0; 10])
     }
 }

@@ -1323,8 +1323,13 @@ dependencies = [
 name = "openbrain-embed"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

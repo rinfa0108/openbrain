@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 
 mod mcp;
 
-use openbrain_embed::{EmbeddingProvider, FakeEmbeddingProvider, NoopEmbeddingProvider};
+use openbrain_embed::{
+    EmbeddingProvider, FakeEmbeddingProvider, NoopEmbeddingProvider, OpenAIEmbeddingProvider,
+};
 use openbrain_server::{build_router, AppState};
 use openbrain_store::PgStore;
 use std::{net::SocketAddr, sync::Arc};
@@ -29,7 +31,7 @@ enum Command {
         #[arg(long, env = "DATABASE_URL")]
         database_url: Option<String>,
 
-        /// Embedding provider selection: "noop" (default) or "fake" (dev/testing only)
+        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), or "openai"
         #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "noop")]
         embed_provider: String,
     },
@@ -39,7 +41,7 @@ enum Command {
         #[arg(long, env = "DATABASE_URL")]
         database_url: Option<String>,
 
-        /// Embedding provider selection: "noop" (default) or "fake" (dev/testing only)
+        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), or "openai"
         #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "noop")]
         embed_provider: String,
     },
@@ -58,6 +60,7 @@ fn select_embedder(name: &str) -> Arc<dyn EmbeddingProvider> {
             warn!("using FakeEmbeddingProvider (dev/testing only)");
             Arc::new(FakeEmbeddingProvider)
         }
+        "openai" => Arc::new(OpenAIEmbeddingProvider::from_env()),
         _ => Arc::new(NoopEmbeddingProvider),
     }
 }

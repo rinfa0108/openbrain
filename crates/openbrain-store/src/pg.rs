@@ -1117,22 +1117,24 @@ impl Store for PgStore {
             });
         }
 
-        let embedding = match self.embedder.embed(&req.model, &normalized_text) {
+        let embedding = match self.embedder.embed(&req.model, &normalized_text).await {
             Ok(v) => v,
             Err(e) => {
-                let (message, details) = match e {
+                let (code, message, details) = match e {
                     EmbedError::ProviderUnavailable => (
+                        ErrorCode::ObEmbeddingFailed,
                         "embedding provider unavailable".to_string(),
                         Some(serde_json::json!({"reason": "provider_unavailable"})),
                     ),
-                    EmbedError::InvalidInput(m) => (m, None),
-                    EmbedError::ProviderError(m) => (m, None),
+                    EmbedError::InvalidInput(m) => (ErrorCode::ObEmbeddingFailed, m, None),
+                    EmbedError::InvalidRequest {
+                        message, details, ..
+                    } => (ErrorCode::ObInvalidRequest, message, details),
+                    EmbedError::ProviderError {
+                        message, details, ..
+                    } => (ErrorCode::ObEmbeddingFailed, message, details),
                 };
-                return Envelope::err(ErrorEnvelope::new(
-                    ErrorCode::ObEmbeddingFailed,
-                    message,
-                    details,
-                ));
+                return Envelope::err(ErrorEnvelope::new(code, message, details));
             }
         };
 
@@ -1216,22 +1218,24 @@ impl Store for PgStore {
             Err(e) => return Envelope::err(e),
         };
 
-        let embedding = match self.embedder.embed(&model, &normalized_query) {
+        let embedding = match self.embedder.embed(&model, &normalized_query).await {
             Ok(v) => v,
             Err(e) => {
-                let (message, details) = match e {
+                let (code, message, details) = match e {
                     EmbedError::ProviderUnavailable => (
+                        ErrorCode::ObEmbeddingFailed,
                         "embedding provider unavailable".to_string(),
                         Some(serde_json::json!({"reason": "provider_unavailable"})),
                     ),
-                    EmbedError::InvalidInput(m) => (m, None),
-                    EmbedError::ProviderError(m) => (m, None),
+                    EmbedError::InvalidInput(m) => (ErrorCode::ObEmbeddingFailed, m, None),
+                    EmbedError::InvalidRequest {
+                        message, details, ..
+                    } => (ErrorCode::ObInvalidRequest, message, details),
+                    EmbedError::ProviderError {
+                        message, details, ..
+                    } => (ErrorCode::ObEmbeddingFailed, message, details),
                 };
-                return Envelope::err(ErrorEnvelope::new(
-                    ErrorCode::ObEmbeddingFailed,
-                    message,
-                    details,
-                ));
+                return Envelope::err(ErrorEnvelope::new(code, message, details));
             }
         };
 
