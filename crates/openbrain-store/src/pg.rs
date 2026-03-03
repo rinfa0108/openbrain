@@ -13,7 +13,8 @@ use uuid::Uuid;
 use crate::{
     EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
     GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
-    SearchStructuredRequest, SearchStructuredResponse, Store,
+    SearchMatch, SearchSemanticRequest, SearchSemanticResponse, SearchStructuredRequest,
+    SearchStructuredResponse, Store,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -445,6 +446,272 @@ fn build_pred(qb: &mut QueryBuilder<'_, Postgres>, pred: &Predicate) -> Result<(
     }
 }
 
+fn field_to_sql_with_alias(
+    field: &FieldPath,
+    alias: &str,
+) -> Result<(String, FieldType), ErrorEnvelope> {
+    let segs = &field.segments;
+    if segs.is_empty() {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::ObInvalidRequest,
+            "empty field path",
+            None,
+        ));
+    }
+
+    let col = |name: &str| format!("{alias}.{name}");
+
+    match segs[0].as_str() {
+        "id" => Ok((col("id"), FieldType::Text)),
+        "scope" => Ok((col("scope"), FieldType::Text)),
+        "type" => Ok((col("type"), FieldType::Text)),
+        "status" => Ok((col("status"), FieldType::Text)),
+        "spec_version" => Ok((col("spec_version"), FieldType::Text)),
+        "created_at" => Ok((col("created_at"), FieldType::Timestamp)),
+        "updated_at" => Ok((col("updated_at"), FieldType::Timestamp)),
+        "tags" => {
+            if segs.len() != 1 {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "tags does not support subfields",
+                    None,
+                ));
+            }
+            Ok((col("tags"), FieldType::Tags))
+        }
+        "data" => {
+            if segs.len() < 2 {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "data requires a field path",
+                    None,
+                ));
+            }
+
+            let path = segs[1..]
+                .iter()
+                .map(|s| {
+                    if s.is_empty() {
+                        Err(ErrorEnvelope::new(
+                            ErrorCode::ObInvalidRequest,
+                            "invalid data path segment",
+                            None,
+                        ))
+                    } else {
+                        Ok(s.clone())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let pg_path = path.join(",");
+            Ok((
+                format!("{alias}.data #>> '{{{pg_path}}}'"),
+                FieldType::JsonText,
+            ))
+        }
+        "provenance" => {
+            if segs.len() == 2 && segs[1] == "ts" {
+                Ok((
+                    format!("{alias}.provenance #>> '{{ts}}'"),
+                    FieldType::JsonTimestamp,
+                ))
+            } else {
+                Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "only provenance.ts is supported in v0.1",
+                    None,
+                ))
+            }
+        }
+        _ => Err(ErrorEnvelope::new(
+            ErrorCode::ObInvalidRequest,
+            "unknown field",
+            Some(serde_json::json!({"field": segs.join(".")})),
+        )),
+    }
+}
+
+fn build_expr_with_alias(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    expr: &Expr,
+    alias: &str,
+) -> Result<(), ErrorEnvelope> {
+    match expr {
+        Expr::And(items) => {
+            qb.push("(");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" AND ");
+                }
+                build_expr_with_alias(qb, it, alias)?;
+            }
+            qb.push(")");
+            Ok(())
+        }
+        Expr::Or(items) => {
+            qb.push("(");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                build_expr_with_alias(qb, it, alias)?;
+            }
+            qb.push(")");
+            Ok(())
+        }
+        Expr::Not(inner) => {
+            qb.push("(NOT ");
+            build_expr_with_alias(qb, inner, alias)?;
+            qb.push(")");
+            Ok(())
+        }
+        Expr::Pred(p) => build_pred_with_alias(qb, p, alias),
+    }
+}
+
+fn build_pred_with_alias(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    pred: &Predicate,
+    alias: &str,
+) -> Result<(), ErrorEnvelope> {
+    match pred {
+        Predicate::Compare { field, op, value } => {
+            let (field_sql, field_type) = field_to_sql_with_alias(field, alias)?;
+            match (field_type, value) {
+                (FieldType::Tags, _) => Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "tags only supports IN [..]",
+                    None,
+                )),
+                (FieldType::Timestamp, Literal::String(s)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    push_cmp_op(qb, *op);
+                    qb.push("(");
+                    qb.push_bind(s.clone());
+                    qb.push("::timestamptz))");
+                    qb.push(")");
+                    Ok(())
+                }
+                (FieldType::JsonTimestamp, Literal::String(s)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    qb.push("::timestamptz");
+                    push_cmp_op(qb, *op);
+                    qb.push("(");
+                    qb.push_bind(s.clone());
+                    qb.push("::timestamptz))");
+                    qb.push(")");
+                    Ok(())
+                }
+                (_, Literal::Null) => match op {
+                    CmpOp::Eq => {
+                        qb.push("(");
+                        qb.push(field_sql);
+                        qb.push(" IS NULL)");
+                        Ok(())
+                    }
+                    CmpOp::Ne => {
+                        qb.push("(");
+                        qb.push(field_sql);
+                        qb.push(" IS NOT NULL)");
+                        Ok(())
+                    }
+                    _ => Err(ErrorEnvelope::new(
+                        ErrorCode::ObInvalidRequest,
+                        "NULL only supports == or !=",
+                        None,
+                    )),
+                },
+                (FieldType::JsonText, Literal::Number(n)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    qb.push("::double precision");
+                    push_cmp_op(qb, *op);
+                    qb.push_bind(*n);
+                    qb.push(")");
+                    Ok(())
+                }
+                (FieldType::JsonText, Literal::Bool(b)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    qb.push("::boolean");
+                    push_cmp_op(qb, *op);
+                    qb.push_bind(*b);
+                    qb.push(")");
+                    Ok(())
+                }
+                (FieldType::JsonText, Literal::String(s)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    push_cmp_op(qb, *op);
+                    qb.push_bind(s.clone());
+                    qb.push(")");
+                    Ok(())
+                }
+                (FieldType::Text, Literal::String(s)) => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    push_cmp_op(qb, *op);
+                    qb.push_bind(s.clone());
+                    qb.push(")");
+                    Ok(())
+                }
+                (FieldType::Text, _) => Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "text fields require string literals",
+                    None,
+                )),
+                (FieldType::Timestamp, _) | (FieldType::JsonTimestamp, _) => {
+                    Err(ErrorEnvelope::new(
+                        ErrorCode::ObInvalidRequest,
+                        "timestamp fields require string literals",
+                        None,
+                    ))
+                }
+            }
+        }
+        Predicate::In { field, values } => {
+            let (field_sql, field_type) = field_to_sql_with_alias(field, alias)?;
+            let strings: Vec<String> = values
+                .iter()
+                .map(|v| match v {
+                    Literal::String(s) => Ok(s.clone()),
+                    _ => Err(ErrorEnvelope::new(
+                        ErrorCode::ObInvalidRequest,
+                        "IN only supports string literals",
+                        None,
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+
+            match field_type {
+                FieldType::Tags => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    qb.push(" && ");
+                    qb.push_bind(strings);
+                    qb.push(")");
+                    Ok(())
+                }
+                FieldType::Text | FieldType::JsonText => {
+                    qb.push("(");
+                    qb.push(field_sql);
+                    qb.push(" = ANY(");
+                    qb.push_bind(strings);
+                    qb.push(")");
+                    qb.push(")");
+                    Ok(())
+                }
+                FieldType::Timestamp | FieldType::JsonTimestamp => Err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "IN is not supported for timestamp fields in v0.1",
+                    None,
+                )),
+            }
+        }
+    }
+}
 fn order_by_sql(order_by: &Option<OrderBySpec>) -> Result<&'static str, ErrorEnvelope> {
     let Some(ob) = order_by else {
         return Ok("updated_at DESC");
@@ -914,6 +1181,161 @@ impl Store for PgStore {
             checksum,
             reused: false,
         })
+    }
+    async fn search_semantic(
+        &self,
+        req: SearchSemanticRequest,
+    ) -> Envelope<SearchSemanticResponse> {
+        if req.scope.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObScopeRequired,
+                "scope is required",
+                None,
+            ));
+        }
+        if req.query.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "query is required",
+                None,
+            ));
+        }
+
+        let top_k = req.top_k.unwrap_or(10).min(50) as i64;
+
+        let model = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default")
+            .to_string();
+
+        let normalized_query = match validate_embedding_text(&req.query, MAX_EMBED_TEXT_LEN) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+
+        let embedding = match self.embedder.embed(&model, &normalized_query) {
+            Ok(v) => v,
+            Err(e) => {
+                let (message, details) = match e {
+                    EmbedError::ProviderUnavailable => (
+                        "embedding provider unavailable".to_string(),
+                        Some(serde_json::json!({"reason": "provider_unavailable"})),
+                    ),
+                    EmbedError::InvalidInput(m) => (m, None),
+                    EmbedError::ProviderError(m) => (m, None),
+                };
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObEmbeddingFailed,
+                    message,
+                    details,
+                ));
+            }
+        };
+
+        let got_dims = embedding.len() as i32;
+        if got_dims != EMBEDDING_DIMS {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObEmbeddingFailed,
+                "provider returned wrong embedding dims",
+                Some(serde_json::json!({"expected": EMBEDDING_DIMS, "got": got_dims})),
+            ));
+        }
+
+        let vector_text = match embedding_to_pgvector_literal(&embedding) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+
+        let expr = match req.filters.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s) => match parse_where(s) {
+                Ok(e) => Some(e),
+                Err(err) => return Envelope::err(err),
+            },
+        };
+
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT o.id as ref, o.type as kind, (1.0 - (e.embedding <=> (",
+        );
+        qb.push_bind(&vector_text);
+        qb.push(")::vector))::float4 as score, o.updated_at::text as updated_at ");
+        qb.push("FROM ob_embeddings e ");
+        qb.push("JOIN ob_objects o ON o.id = e.object_id ");
+        qb.push("WHERE e.object_id IS NOT NULL ");
+        qb.push("AND e.scope = ");
+        qb.push_bind(&req.scope);
+        qb.push(" AND o.scope = ");
+        qb.push_bind(&req.scope);
+        qb.push(" AND e.model = ");
+        qb.push_bind(&model);
+        qb.push(" AND e.dims = ");
+        qb.push_bind(EMBEDDING_DIMS);
+
+        if let Some(types) = &req.types {
+            if types.is_empty() {
+                return Envelope::ok(SearchSemanticResponse { matches: vec![] });
+            }
+            qb.push(" AND o.type = ANY(");
+            qb.push_bind(types.clone());
+            qb.push(")");
+        }
+
+        if let Some(status) = &req.status {
+            if status.is_empty() {
+                return Envelope::ok(SearchSemanticResponse { matches: vec![] });
+            }
+            qb.push(" AND o.status = ANY(");
+            qb.push_bind(status.clone());
+            qb.push(")");
+        }
+
+        if let Some(e) = &expr {
+            qb.push(" AND ");
+            if let Err(err) = build_expr_with_alias(&mut qb, e, "o") {
+                return Envelope::err(err);
+            }
+        }
+
+        qb.push(" ORDER BY e.embedding <=> (");
+        qb.push_bind(&vector_text);
+        qb.push(")::vector ASC");
+        qb.push(" LIMIT ");
+        qb.push_bind(top_k);
+
+        #[derive(sqlx::FromRow)]
+        struct RowOut {
+            r#ref: String,
+            kind: String,
+            score: f32,
+            updated_at: String,
+        }
+
+        let rows: Vec<RowOut> = match qb.build_query_as().fetch_all(&self.pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("semantic search failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let matches = rows
+            .into_iter()
+            .map(|r| SearchMatch {
+                r#ref: r.r#ref,
+                kind: r.kind,
+                score: r.score,
+                updated_at: r.updated_at,
+                snippet: None,
+            })
+            .collect();
+
+        Envelope::ok(SearchSemanticResponse { matches })
     }
 
     async fn append_event(
