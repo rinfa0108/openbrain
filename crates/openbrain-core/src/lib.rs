@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod query;
+pub mod textnorm;
 
 pub const SPEC_VERSION: &str = "0.1";
 
@@ -15,6 +16,7 @@ pub enum ErrorCode {
     ObNotFound,
     ObConflict,
     ObStorageError,
+    ObEmbeddingFailed,
     ObInternal,
 }
 
@@ -28,6 +30,7 @@ impl ErrorCode {
             Self::ObNotFound => "OB_NOT_FOUND",
             Self::ObConflict => "OB_CONFLICT",
             Self::ObStorageError => "OB_STORAGE_ERROR",
+            Self::ObEmbeddingFailed => "OB_EMBEDDING_FAILED",
             Self::ObInternal => "OB_INTERNAL",
         }
     }
