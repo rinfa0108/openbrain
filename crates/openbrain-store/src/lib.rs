@@ -40,11 +40,56 @@ pub struct GetObjectsResponse {
     pub objects: Vec<MemoryObjectStored>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderBySpec {
+    pub field: String,
+    pub direction: OrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchStructuredRequest {
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub where_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<OrderBySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchItem {
+    pub r#ref: String,
+    #[serde(rename = "type")]
+    pub object_type: String,
+    pub status: String,
+    pub updated_at: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchStructuredResponse {
+    pub results: Vec<SearchItem>,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn put_objects(&self, req: PutObjectsRequest) -> Envelope<PutObjectsResponse>;
 
     async fn get_objects(&self, req: GetObjectsRequest) -> Envelope<GetObjectsResponse>;
+
+    async fn search_structured(
+        &self,
+        req: SearchStructuredRequest,
+    ) -> Envelope<SearchStructuredResponse>;
 
     async fn append_event(
         &self,
