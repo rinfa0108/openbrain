@@ -1,4 +1,6 @@
 use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope, SPEC_VERSION};
+use openbrain_llm::AnthropicClient;
+use openbrain_server::service;
 use openbrain_store::{
     EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
     SearchStructuredRequest, Store,
@@ -123,7 +125,7 @@ struct ReadArgs {
     refs: Vec<String>,
 }
 
-pub async fn run_mcp_stdio<S>(store: S) -> std::io::Result<()>
+pub async fn run_mcp_stdio<S>(store: S, llm: AnthropicClient) -> std::io::Result<()>
 where
     S: Store + Clone + 'static,
 {
@@ -150,7 +152,7 @@ where
 
         let req: Result<RpcRequest, _> = serde_json::from_str(&line);
         let resp = match req {
-            Ok(r) => handle_request(store.clone(), r).await,
+            Ok(r) => handle_request(store.clone(), llm.clone(), r).await,
             Err(e) => RpcResponse::error(
                 None,
                 -32700,
@@ -171,7 +173,7 @@ where
     Ok(())
 }
 
-async fn handle_request<S>(store: S, req: RpcRequest) -> RpcResponse
+async fn handle_request<S>(store: S, llm: AnthropicClient, req: RpcRequest) -> RpcResponse
 where
     S: Store + Clone + 'static,
 {
@@ -200,7 +202,9 @@ where
                     {"name":"openbrain.read","description":"Read objects (scoped)","inputSchema": {"type":"object"}},
                     {"name":"openbrain.search.structured","description":"Structured search","inputSchema": {"type":"object"}},
                     {"name":"openbrain.embed.generate","description":"Generate embedding","inputSchema": {"type":"object"}},
-                    {"name":"openbrain.search.semantic","description":"Semantic search","inputSchema": {"type":"object"}}
+                    {"name":"openbrain.search.semantic","description":"Semantic search","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.rerank","description":"Rerank candidates","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.memory.pack","description":"Build memory pack","inputSchema": {"type":"object"}}
                 ]
             });
             RpcResponse::result(id, tools)
@@ -222,14 +226,14 @@ where
                 }
             };
 
-            let result = dispatch_tool(store, call).await;
+            let result = dispatch_tool(store, llm, call).await;
             RpcResponse::result(id, serde_json::to_value(result).unwrap())
         }
         _ => RpcResponse::error(id, -32601, "method not found", None),
     }
 }
 
-async fn dispatch_tool<S>(store: S, call: ToolsCallParams) -> Envelope<Value>
+async fn dispatch_tool<S>(store: S, llm: AnthropicClient, call: ToolsCallParams) -> Envelope<Value>
 where
     S: Store + Clone + 'static,
 {
@@ -354,6 +358,36 @@ where
             }
 
             envelope_to_value(store.search_semantic(req).await)
+        }
+        "openbrain.rerank" => {
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: service::RerankRequest = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({ "error": e.to_string() })),
+                    )
+                }
+            };
+
+            envelope_to_value(service::rerank(&store, &llm, req).await)
+        }
+        "openbrain.memory.pack" => {
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: service::MemoryPackRequest = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({ "error": e.to_string() })),
+                    )
+                }
+            };
+
+            envelope_to_value(service::build_pack(&store, &llm, req).await)
         }
         _ => env_err(
             ErrorCode::ObInvalidRequest,
