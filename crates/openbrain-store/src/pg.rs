@@ -879,7 +879,7 @@ impl Store for PgStore {
         }
 
         let embedding_id = Uuid::new_v4().to_string();
-                let vector_text = match embedding_to_pgvector_literal(&embedding) {
+        let vector_text = match embedding_to_pgvector_literal(&embedding) {
             Ok(v) => v,
             Err(e) => return Envelope::err(e),
         };
@@ -935,6 +935,3 @@ impl Store for PgStore {
         .await;
     }
 }
-
-
-

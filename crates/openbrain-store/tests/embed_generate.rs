@@ -1,8 +1,6 @@
 use openbrain_core::{Envelope, MemoryObject};
 use openbrain_embed::FakeEmbeddingProvider;
-use openbrain_store::{
-    EmbedGenerateRequest, EmbedTarget, PgStore, PutObjectsRequest, Store,
-};
+use openbrain_store::{EmbedGenerateRequest, EmbedTarget, PgStore, PutObjectsRequest, Store};
 use sqlx::PgPool;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +17,9 @@ async fn setup_pool() -> Option<PgPool> {
         }
     };
 
-    let store = PgStore::connect(&database_url).await.expect("connect postgres");
+    let store = PgStore::connect(&database_url)
+        .await
+        .expect("connect postgres");
     let pool = store.pool().clone();
 
     let migrations_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
@@ -136,13 +136,12 @@ async fn embed_generate_ref_stores_object_id() {
         Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
     };
 
-    let stored_object_id: Option<String> = sqlx::query_scalar(
-        r#"SELECT object_id FROM ob_embeddings WHERE id = $1"#,
-    )
-    .bind(&embedding_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read embedding row");
+    let stored_object_id: Option<String> =
+        sqlx::query_scalar(r#"SELECT object_id FROM ob_embeddings WHERE id = $1"#)
+            .bind(&embedding_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read embedding row");
 
     assert_eq!(stored_object_id.as_deref(), Some(id.as_str()));
 }
@@ -195,4 +194,3 @@ async fn embed_generate_large_text_rejected() {
         Envelope::Err { error, .. } => assert_eq!(error.code, "OB_INVALID_REQUEST"),
     }
 }
-
