@@ -1,22 +1,51 @@
 use async_trait::async_trait;
 use openbrain_core::query::{parse_where, CmpOp, Expr, FieldPath, Literal, Predicate};
+use openbrain_core::textnorm::{checksum_v01, normalize_object_text, validate_embedding_text};
 use openbrain_core::{
     Envelope, ErrorCode, ErrorEnvelope, MemoryObjectStored, ValidatedMemoryObject,
 };
+use openbrain_embed::{EmbedError, EmbeddingProvider, NoopEmbeddingProvider};
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder, Row, Transaction};
+use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::{
-    GetObjectsRequest, GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse,
-    PutResult, SearchItem, SearchStructuredRequest, SearchStructuredResponse, Store,
+    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
+    GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
+    SearchStructuredRequest, SearchStructuredResponse, Store,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
 
+const EMBEDDING_DIMS: i32 = 1536;
+const MAX_EMBED_TEXT_LEN: usize = 32 * 1024;
+
+fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
+    let mut out = String::with_capacity(embedding.len() * 12 + 2);
+    out.push('[');
+    for (i, v) in embedding.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObEmbeddingFailed,
+                "embedding contains non-finite values",
+                Some(serde_json::json!({"index": i})),
+            ));
+        }
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&v.to_string());
+    }
+    out.push(']');
+    Ok(out)
+}
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    embedder: Arc<dyn EmbeddingProvider>,
 }
 
 impl PgStore {
@@ -25,11 +54,32 @@ impl PgStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            embedder: Arc::new(NoopEmbeddingProvider),
+        })
+    }
+
+    pub async fn connect_with_embedder(
+        database_url: &str,
+        embedder: Arc<dyn EmbeddingProvider>,
+    ) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await?;
+        Ok(Self { pool, embedder })
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            embedder: Arc::new(NoopEmbeddingProvider),
+        }
+    }
+
+    pub fn from_pool_with_embedder(pool: PgPool, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        Self { pool, embedder }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -675,6 +725,196 @@ impl Store for PgStore {
 
         Envelope::ok(SearchStructuredResponse { results })
     }
+    async fn embed_generate(&self, req: EmbedGenerateRequest) -> Envelope<EmbedGenerateResponse> {
+        if req.scope.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObScopeRequired,
+                "scope is required",
+                None,
+            ));
+        }
+        if req.model.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "model is required",
+                None,
+            ));
+        }
+
+        let dims = req.dims.unwrap_or(EMBEDDING_DIMS);
+        if dims != EMBEDDING_DIMS {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "dims must be 1536 for v0.1",
+                Some(serde_json::json!({"expected": EMBEDDING_DIMS, "got": dims})),
+            ));
+        }
+
+        let (normalized_text, checksum, object_id) = match &req.target {
+            EmbedTarget::Text { text } => {
+                let normalized = match validate_embedding_text(text, MAX_EMBED_TEXT_LEN) {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+                let checksum = checksum_v01(&normalized);
+                (normalized, checksum, None)
+            }
+            EmbedTarget::Ref { r#ref } => {
+                #[derive(sqlx::FromRow)]
+                struct ObjRow {
+                    id: String,
+                    r#type: String,
+                    data: sqlx::types::Json<Value>,
+                }
+
+                let row: Option<ObjRow> = match sqlx::query_as(
+                    r#"SELECT id, type, data
+                       FROM ob_objects
+                       WHERE id = $1 AND scope = $2
+                       LIMIT 1"#,
+                )
+                .bind(r#ref)
+                .bind(&req.scope)
+                .fetch_optional(&self.pool)
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Envelope::err(ErrorEnvelope::new(
+                            ErrorCode::ObStorageError,
+                            format!("read failed: {e}"),
+                            None,
+                        ));
+                    }
+                };
+
+                let Some(row) = row else {
+                    return Envelope::err(ErrorEnvelope::new(
+                        ErrorCode::ObNotFound,
+                        "ref not found",
+                        Some(serde_json::json!({"ref": r#ref})),
+                    ));
+                };
+
+                let normalized = match normalize_object_text(&row.r#type, &row.data.0) {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+
+                let normalized = match validate_embedding_text(&normalized, MAX_EMBED_TEXT_LEN) {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+
+                let checksum = checksum_v01(&normalized);
+                (normalized, checksum, Some(row.id))
+            }
+        };
+
+        #[derive(sqlx::FromRow)]
+        struct ExistingRow {
+            id: String,
+            object_id: Option<String>,
+        }
+
+        let existing: Option<ExistingRow> = match sqlx::query_as(
+            r#"SELECT id, object_id
+               FROM ob_embeddings
+               WHERE scope = $1 AND model = $2 AND checksum = $3
+               LIMIT 1"#,
+        )
+        .bind(&req.scope)
+        .bind(&req.model)
+        .bind(&checksum)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("dedupe lookup failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        if let Some(row) = existing {
+            return Envelope::ok(EmbedGenerateResponse {
+                embedding_id: row.id,
+                object_id: row.object_id.or(object_id),
+                model: req.model,
+                dims,
+                checksum,
+                reused: true,
+            });
+        }
+
+        let embedding = match self.embedder.embed(&req.model, &normalized_text) {
+            Ok(v) => v,
+            Err(e) => {
+                let (message, details) = match e {
+                    EmbedError::ProviderUnavailable => (
+                        "embedding provider unavailable".to_string(),
+                        Some(serde_json::json!({"reason": "provider_unavailable"})),
+                    ),
+                    EmbedError::InvalidInput(m) => (m, None),
+                    EmbedError::ProviderError(m) => (m, None),
+                };
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObEmbeddingFailed,
+                    message,
+                    details,
+                ));
+            }
+        };
+
+        let got_dims = embedding.len() as i32;
+        if got_dims != EMBEDDING_DIMS {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObEmbeddingFailed,
+                "provider returned wrong embedding dims",
+                Some(serde_json::json!({"expected": EMBEDDING_DIMS, "got": got_dims})),
+            ));
+        }
+
+        let embedding_id = Uuid::new_v4().to_string();
+                let vector_text = match embedding_to_pgvector_literal(&embedding) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO ob_embeddings
+               (id, object_id, scope, model, dims, checksum, embedding)
+               VALUES ($1, $2, $3, $4, $5, $6, ($7)::vector)"#,
+        )
+        .bind(&embedding_id)
+        .bind(object_id.as_deref())
+        .bind(&req.scope)
+        .bind(&req.model)
+        .bind(dims)
+        .bind(&checksum)
+        .bind(&vector_text)
+        .execute(&self.pool)
+        .await
+        {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("failed to insert embedding: {e}"),
+                None,
+            ));
+        }
+
+        Envelope::ok(EmbedGenerateResponse {
+            embedding_id,
+            object_id,
+            model: req.model,
+            dims,
+            checksum,
+            reused: false,
+        })
+    }
 
     async fn append_event(
         &self,
@@ -695,3 +935,6 @@ impl Store for PgStore {
         .await;
     }
 }
+
+
+

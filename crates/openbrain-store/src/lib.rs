@@ -80,6 +80,33 @@ pub struct SearchStructuredResponse {
     pub results: Vec<SearchItem>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbedTarget {
+    Text { text: String },
+    Ref { r#ref: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbedGenerateRequest {
+    pub scope: String,
+    pub target: EmbedTarget,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbedGenerateResponse {
+    pub embedding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    pub model: String,
+    pub dims: i32,
+    pub checksum: String,
+    pub reused: bool,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn put_objects(&self, req: PutObjectsRequest) -> Envelope<PutObjectsResponse>;
@@ -90,6 +117,8 @@ pub trait Store: Send + Sync {
         &self,
         req: SearchStructuredRequest,
     ) -> Envelope<SearchStructuredResponse>;
+
+    async fn embed_generate(&self, req: EmbedGenerateRequest) -> Envelope<EmbedGenerateResponse>;
 
     async fn append_event(
         &self,
