@@ -76,3 +76,27 @@ Minimal examples (adjust `scope`/`id`):
 
 - Semantic search:
   - `curl -sS -X POST http://127.0.0.1:7981/v1/search/semantic -H "content-type: application/json" -d '{"scope":"demo","query":"a b c","top_k":5,"model":"fake"}'`
+
+## MCP (Iteration 6)
+
+### Run MCP stdio
+
+- Required env:
+  - `DATABASE_URL=postgres://...`
+- Optional env:
+  - `OPENBRAIN_EMBED_PROVIDER=noop|fake` (default: `noop`)
+
+Run from repo root:
+
+- `cargo run -p openbrain-server -- mcp`
+
+### Quick MCP smoke test (high level)
+
+Use any MCP-capable client/host and call:
+
+- tool: `openbrain.ping`
+- arguments: `{}`
+
+Expected envelope:
+
+- `{ "ok": true, "version": "0.1", "server_time": "..." }`
