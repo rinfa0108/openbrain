@@ -81,6 +81,36 @@ pub struct SearchStructuredResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchSemanticRequest {
+    pub scope: String,
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    pub r#ref: String,
+    pub kind: String,
+    pub score: f32,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchSemanticResponse {
+    pub matches: Vec<SearchMatch>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedTarget {
     Text { text: String },
@@ -119,6 +149,9 @@ pub trait Store: Send + Sync {
     ) -> Envelope<SearchStructuredResponse>;
 
     async fn embed_generate(&self, req: EmbedGenerateRequest) -> Envelope<EmbedGenerateResponse>;
+
+    async fn search_semantic(&self, req: SearchSemanticRequest)
+        -> Envelope<SearchSemanticResponse>;
 
     async fn append_event(
         &self,
