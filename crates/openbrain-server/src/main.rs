@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 mod mcp;
 
 use openbrain_embed::{
-    EmbeddingProvider, FakeEmbeddingProvider, NoopEmbeddingProvider, OpenAIEmbeddingProvider,
+    EmbeddingProvider, FakeEmbeddingProvider, LocalHttpEmbeddingProvider, NoopEmbeddingProvider,
+    OpenAIEmbeddingProvider,
 };
 use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, AppState};
@@ -32,7 +33,7 @@ enum Command {
         #[arg(long, env = "DATABASE_URL")]
         database_url: Option<String>,
 
-        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), or "openai"
+        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), "openai", or "local"
         #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "noop")]
         embed_provider: String,
     },
@@ -42,7 +43,7 @@ enum Command {
         #[arg(long, env = "DATABASE_URL")]
         database_url: Option<String>,
 
-        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), or "openai"
+        /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), "openai", or "local"
         #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "noop")]
         embed_provider: String,
     },
@@ -62,6 +63,7 @@ fn select_embedder(name: &str) -> Arc<dyn EmbeddingProvider> {
             Arc::new(FakeEmbeddingProvider)
         }
         "openai" => Arc::new(OpenAIEmbeddingProvider::from_env()),
+        "local" => Arc::new(LocalHttpEmbeddingProvider::from_env()),
         _ => Arc::new(NoopEmbeddingProvider),
     }
 }

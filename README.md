@@ -111,6 +111,7 @@ Environment:
 - `OPENBRAIN_EMBED_PROVIDER=noop` (default)  
 - `OPENBRAIN_EMBED_PROVIDER=fake` (deterministic dev/test only)  
 - `OPENBRAIN_EMBED_PROVIDER=openai` (real embeddings)
+- `OPENBRAIN_EMBED_PROVIDER=local` (local HTTP embeddings)
 
 OpenAI provider env (v0.1):
 - `OPENAI_API_KEY` (required when provider=openai)
@@ -120,6 +121,23 @@ OpenAI provider env (v0.1):
 - `OPENAI_EMBED_DIMS` (optional; if set must be 1536)
 
 > v0.1 uses a fixed embedding dimension of **1536** (pgvector column is `vector(1536)`).
+
+Local HTTP provider env (v0.1):
+- `LOCAL_EMBED_URL` (required when provider=local; example: `http://127.0.0.1:8080/embeddings`)
+- `LOCAL_EMBED_MODEL` (optional)
+- `LOCAL_EMBED_TIMEOUT_SECS` (optional)
+- `LOCAL_EMBED_HEADER_*` (optional; forwarded as HTTP headers)
+
+Local HTTP contract (implemented in v0.1):
+Request:
+```json
+{ "model": "optional-model", "input": "text..." }
+```
+
+Response:
+```json
+{ "data": [ { "embedding": [0.01, 0.02, "..."] } ] }
+```
 
 Claude rerank/pack env (v0.1):
 - `ANTHROPIC_API_KEY` (required for rerank/pack)

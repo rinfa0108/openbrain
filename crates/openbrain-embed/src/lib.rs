@@ -1,9 +1,11 @@
+mod local_http;
 mod openai;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub use local_http::{LocalHttpConfig, LocalHttpEmbeddingProvider};
 pub use openai::{OpenAIConfig, OpenAIEmbeddingProvider};
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +129,7 @@ pub fn embedder_from_env(name: &str) -> std::sync::Arc<dyn EmbeddingProvider> {
     match name.trim().to_ascii_lowercase().as_str() {
         "fake" => std::sync::Arc::new(FakeEmbeddingProvider),
         "openai" => std::sync::Arc::new(OpenAIEmbeddingProvider::from_env()),
+        "local" => std::sync::Arc::new(LocalHttpEmbeddingProvider::from_env()),
         _ => std::sync::Arc::new(NoopEmbeddingProvider),
     }
 }
