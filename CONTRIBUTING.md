@@ -1,4 +1,4 @@
-# Contributing
+﻿# Contributing
 
 ## Prereqs
 
@@ -37,7 +37,7 @@ Example (Docker):
 - Optional env:
   - `OPENBRAIN_BIND=127.0.0.1` (default)
   - `OPENBRAIN_PORT=7981` (default)
-  - `OPENBRAIN_EMBED_PROVIDER=noop|fake` (default: `noop`)
+  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai` (default: `noop`)
 
 Run from repo root:
 
@@ -84,7 +84,7 @@ Minimal examples (adjust `scope`/`id`):
 - Required env:
   - `DATABASE_URL=postgres://...`
 - Optional env:
-  - `OPENBRAIN_EMBED_PROVIDER=noop|fake` (default: `noop`)
+  - `OPENBRAIN_EMBED_PROVIDER=noop|fake|openai` (default: `noop`)
 
 Run from repo root:
 
@@ -100,3 +100,21 @@ Use any MCP-capable client/host and call:
 Expected envelope:
 
 - `{ "ok": true, "version": "0.1", "server_time": "..." }`
+
+## OpenAI embeddings provider (IT7A)
+
+Enable real embeddings (no paid CI required; local-only):
+
+- `OPENBRAIN_EMBED_PROVIDER=openai`
+- `OPENAI_API_KEY=...` (required)
+
+Optional:
+
+- `OPENAI_EMBED_MODEL` (default: `text-embedding-3-small`)
+- `OPENAI_BASE_URL` (default: `https://api.openai.com`)
+- `OPENAI_TIMEOUT_SECS` (default: `30`)
+- `OPENAI_EMBED_DIMS` (optional; if set must be `1536`)
+
+Live OpenAI tests are opt-in only:
+
+- set `RUN_OPENAI_LIVE_TESTS=1` and `OPENAI_API_KEY` to run `crates/openbrain-embed/tests/openai_live.rs`

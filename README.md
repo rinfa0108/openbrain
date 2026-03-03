@@ -1,4 +1,4 @@
-# OpenBrain (v0.1)
+﻿# OpenBrain (v0.1)
 
 OpenBrain is a local-first, provider-agnostic **typed memory layer** for agent runtimes.
 
@@ -53,6 +53,21 @@ Environment:
   - `embed.generate` / semantic search will return `OB_EMBEDDING_FAILED` with a clear message
 - `OPENBRAIN_EMBED_PROVIDER=fake` (dev/testing only)
   - deterministic 1536-dim embeddings
+- `OPENBRAIN_EMBED_PROVIDER=openai`
+  - real OpenAI embeddings (requires `OPENAI_API_KEY`)
+  - default model: `text-embedding-3-small` (1536 dims)
+
+OpenAI env:
+
+- `OPENAI_API_KEY` (required)
+- `OPENAI_EMBED_MODEL` (optional)
+- `OPENAI_BASE_URL` (optional)
+- `OPENAI_TIMEOUT_SECS` (optional)
+- `OPENAI_EMBED_DIMS` (optional; must be `1536` if set)
+
+Live tests:
+
+- Opt-in only: set `RUN_OPENAI_LIVE_TESTS=1` and `OPENAI_API_KEY` to enable the live OpenAI test in `crates/openbrain-embed/tests/openai_live.rs`.
 
 > v0.1 uses fixed dims `1536` (pgvector column is `vector(1536)`).
 
