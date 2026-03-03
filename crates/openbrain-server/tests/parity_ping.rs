@@ -1,4 +1,5 @@
 use openbrain_embed::NoopEmbeddingProvider;
+use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, AppState};
 use openbrain_store::PgStore;
 use serde_json::Value;
@@ -15,7 +16,8 @@ async fn spawn_http_server(database_url: &str) -> (String, tokio::sync::oneshot:
     let store =
         PgStore::from_pool_with_embedder(store.pool().clone(), Arc::new(NoopEmbeddingProvider));
 
-    let app = build_router(AppState { store });
+    let llm = AnthropicClient::from_env();
+    let app = build_router(AppState { store, llm });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

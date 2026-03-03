@@ -6,6 +6,8 @@ use axum::{
     Json, Router,
 };
 use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope};
+use openbrain_llm::AnthropicClient;
+pub mod service;
 use openbrain_store::{
     EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
     SearchStructuredRequest, Store,
@@ -19,6 +21,7 @@ const MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState<S> {
     pub store: S,
+    pub llm: AnthropicClient,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +41,8 @@ where
         .route("/v1/search/structured", post(search_structured::<S>))
         .route("/v1/embed/generate", post(embed_generate::<S>))
         .route("/v1/search/semantic", post(search_semantic::<S>))
+        .route("/v1/rerank", post(rerank::<S>))
+        .route("/v1/memory/pack", post(memory_pack::<S>))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -240,4 +245,34 @@ where
     }
 
     Json(state.store.search_semantic(req).await)
+}
+
+async fn rerank<S>(
+    State(state): State<AppState<S>>,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + Clone + 'static,
+{
+    let req = match parse_json_body::<service::RerankRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<service::RerankResponse>>(Envelope::err(e)),
+    };
+
+    Json(service::rerank(&state.store, &state.llm, req).await)
+}
+
+async fn memory_pack<S>(
+    State(state): State<AppState<S>>,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + Clone + 'static,
+{
+    let req = match parse_json_body::<service::MemoryPackRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e)),
+    };
+
+    Json(service::build_pack(&state.store, &state.llm, req).await)
 }

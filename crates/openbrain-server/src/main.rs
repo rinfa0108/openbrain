@@ -5,6 +5,7 @@ mod mcp;
 use openbrain_embed::{
     EmbeddingProvider, FakeEmbeddingProvider, NoopEmbeddingProvider, OpenAIEmbeddingProvider,
 };
+use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, AppState};
 use openbrain_store::PgStore;
 use std::{net::SocketAddr, sync::Arc};
@@ -102,7 +103,8 @@ async fn main() {
                 std::process::exit(2);
             });
 
-            let app = build_router(AppState { store });
+            let llm = AnthropicClient::from_env();
+            let app = build_router(AppState { store, llm });
 
             info!("OpenBrain server (spec v{})", openbrain_core::SPEC_VERSION);
             info!("listening on http://{}", addr);
@@ -136,7 +138,8 @@ async fn main() {
                 openbrain_core::SPEC_VERSION
             );
 
-            if let Err(e) = mcp::run_mcp_stdio(store).await {
+            let llm = AnthropicClient::from_env();
+            if let Err(e) = mcp::run_mcp_stdio(store, llm).await {
                 eprintln!("mcp error: {e}");
                 std::process::exit(1);
             }

@@ -118,3 +118,24 @@ Optional:
 Live OpenAI tests are opt-in only:
 
 - set `RUN_OPENAI_LIVE_TESTS=1` and `OPENAI_API_KEY` to run `crates/openbrain-embed/tests/openai_live.rs`
+
+## Claude rerank + memory pack (IT7B)
+
+Required env:
+
+- `ANTHROPIC_API_KEY=...`
+
+Optional:
+
+- `ANTHROPIC_MODEL` (default: `claude-3-5-sonnet-latest`)
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_TIMEOUT_SECS`
+
+Endpoints/tools added:
+
+- HTTP: `POST /v1/rerank`, `POST /v1/memory/pack`
+- MCP: `openbrain.rerank`, `openbrain.memory.pack`
+
+Live Anthropic tests are opt-in only:
+
+- set `RUN_ANTHROPIC_LIVE_TESTS=1` and `ANTHROPIC_API_KEY` to run `crates/openbrain-llm/tests/anthropic_live.rs`

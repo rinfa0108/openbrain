@@ -1,160 +1,296 @@
-﻿# OpenBrain (v0.1)
+# OpenBrain (v0.1) — Provider-Agnostic Structured Memory for AI Agents
 
-OpenBrain is a local-first, provider-agnostic **typed memory layer** for agent runtimes.
+OpenBrain is an open-source **machine-readable memory layer** for agentic systems.  
+It stores **typed, versioned memory objects** (claims, decisions, tasks, artifacts, entities, relations, thought summaries), supports **structured queries + semantic search**, and exposes a **standard plug-in protocol via MCP** (and a **mirror HTTP API**).
 
-- **Primary agent integration:** **MCP (stdio)** via `openbrain mcp`
-- **Mirror/debug/SDK interface:** **HTTP** via `openbrain serve` (`/v1/*` on localhost)
+**Goal:** stop context switching / context rot by moving memory out of provider silos (ChatGPT/Codex/Claude/Gemini/local models) into an agent-owned infrastructure plane.
 
-OpenBrain provides:
+> **NOTE (Do not edit without explicit instruction):**  
+> The **header + hero lines** above and the **License/footer** at the end of this README are considered **project identity text**.  
+> Please **refrain from changing** them unless explicitly instructed by the project owner.
 
-- Typed, versioned memory objects stored in Postgres (`ob_objects`) + append-only event log (`ob_events`)
-- Deterministic structured search using a safe Query DSL
-- Embedding pipeline + semantic search via pgvector (cosine similarity)
+---
+
+## Current status (implemented in main)
+
+✅ Implemented (v0.1 core)
+- Postgres storage for typed objects (`ob_objects`) + append-only event log (`ob_events`)
+- Query DSL + deterministic structured search
+- Embedding pipeline:
+  - canonical text normalization + checksum (`sha256("ob.v0.1\n" + text)`)
+  - embedding dedupe by `(scope, model, checksum)`
+  - `embed.generate`
+- Semantic search using pgvector cosine ranking with optional safe DSL filters
+- Local-first daemon:
+  - MCP stdio: `openbrain mcp` (**primary for agents**)
+  - HTTP: `openbrain serve` (**mirror/debug/SDK**)
+
+🕒 Planned / not yet implemented
+- MCP-over-HTTP transport
+- Promotion workflow (`promote`), conflict detection (`conflicts.list`), timeline API, policy engine (`policy.explain`)
+- Auth / multi-user / remote deployment defaults (currently local-only)
+- Multi-dim embeddings (v0.2+)
+- Multi-embedding strategy (optional, later; tracked to prevent drift)
+
+---
 
 ## Quickstart
 
 ### Prerequisites
+- Rust toolchain (stable) and Cargo
+- Postgres with **pgvector** extension available
+- A `DATABASE_URL` pointing to the Postgres instance
 
-- Rust (stable)
-- Postgres with `pgvector` available
-- `DATABASE_URL` set (required)
+### Run Postgres + pgvector (example)
+Use any Postgres that has pgvector. Example Docker image:
+- `pgvector/pgvector:pg16`
 
-Migrations live in `migrations/`.
+(See `CONTRIBUTING.md` for concrete commands and curl examples.)
 
-### Run MCP stdio (primary)
+### Migrate
+OpenBrain migrations live in `migrations/`.  
+Tests run migrations automatically via `sqlx::migrate::Migrator`.
 
+---
+
+## Interfaces
+
+### MCP stdio (primary for agents)
+Run:
 ```bash
 export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
 openbrain mcp
 ```
 
-### Run HTTP daemon (mirror)
+Implemented tools (names exact):
+- `openbrain.ping`
+- `openbrain.write`
+- `openbrain.read` (scoped: `{ scope, refs }`)
+- `openbrain.search.structured`
+- `openbrain.embed.generate`
+- `openbrain.search.semantic`
+- `openbrain.rerank`
+- `openbrain.memory.pack`
 
+### HTTP mirror (debug/SDK)
+Run:
 ```bash
 export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
 openbrain serve
 ```
 
 Defaults:
-
 - Bind: `127.0.0.1`
 - Port: `7981`
 
 Overrides:
-
 - `OPENBRAIN_BIND`
 - `OPENBRAIN_PORT`
 
-### Embedding provider selection
-
-Environment:
-
-- `OPENBRAIN_EMBED_PROVIDER=noop` (default)
-  - `embed.generate` / semantic search will return `OB_EMBEDDING_FAILED` with a clear message
-- `OPENBRAIN_EMBED_PROVIDER=fake` (dev/testing only)
-  - deterministic 1536-dim embeddings
-- `OPENBRAIN_EMBED_PROVIDER=openai`
-  - real OpenAI embeddings (requires `OPENAI_API_KEY`)
-  - default model: `text-embedding-3-small` (1536 dims)
-
-OpenAI env:
-
-- `OPENAI_API_KEY` (required)
-- `OPENAI_EMBED_MODEL` (optional)
-- `OPENAI_BASE_URL` (optional)
-- `OPENAI_TIMEOUT_SECS` (optional)
-- `OPENAI_EMBED_DIMS` (optional; must be `1536` if set)
-
-Live tests:
-
-- Opt-in only: set `RUN_OPENAI_LIVE_TESTS=1` and `OPENAI_API_KEY` to enable the live OpenAI test in `crates/openbrain-embed/tests/openai_live.rs`.
-
-> v0.1 uses fixed dims `1536` (pgvector column is `vector(1536)`).
-
-## Envelopes + parity
-
-All interfaces use the same envelope:
-
-- success: `{ "ok": true, ... }`
-- error: `{ "ok": false, "error": { "code": "...", "message": "...", "details": { ... } } }`
-
-**Parity statement (required):** MCP tools map **1:1** to the same store/service methods used by HTTP. Envelopes and canonical error codes are identical across both interfaces.
-
-## MCP tools (implemented)
-
-Tool names (exact):
-
-- `openbrain.ping`
-- `openbrain.write`
-- `openbrain.read` (**scoped**: requires `scope` + `refs`)
-- `openbrain.search.structured`
-- `openbrain.embed.generate`
-- `openbrain.search.semantic`
-
-Notes:
-
-- Tools that require scope will return `OB_SCOPE_REQUIRED` if `scope` is missing/blank.
-
-Request argument shapes (high level):
-
-- `openbrain.ping` arguments: `{}`
-- `openbrain.write` arguments: `PutObjectsRequest` (see HTTP `/v1/write`)
-- `openbrain.read` arguments: `{ "scope": "...", "refs": ["..."] }`
-- `openbrain.search.structured` arguments: `SearchStructuredRequest`
-- `openbrain.embed.generate` arguments: `EmbedGenerateRequest`
-- `openbrain.search.semantic` arguments: `SearchSemanticRequest`
-
-## HTTP endpoints (implemented mirror)
-
-Endpoints (exact, all **POST**):
-
+Endpoints (POST):
 - `/v1/ping`
 - `/v1/write`
-- `/v1/read` (**scoped**)
+- `/v1/read` (scoped)
 - `/v1/search/structured`
 - `/v1/embed/generate`
 - `/v1/search/semantic`
+- `/v1/rerank`
+- `/v1/memory/pack`
 
-Examples:
+### Parity guarantee
+MCP tools map **1:1** to the same store/service methods used by HTTP.  
+Response envelopes and error codes are identical across both interfaces.
 
-- Ping:
-  - `curl -sS -X POST http://127.0.0.1:7981/v1/ping`
+---
 
-## Query DSL (implemented subset, v0.1)
+## Embedding provider selection
 
-Supported:
+OpenBrain uses a pluggable `EmbeddingProvider`.
 
-- Comparisons: `==`, `!=`, `>`, `>=`, `<`, `<=`
-- Membership: `IN [..]`
-- Boolean: `AND`, `OR`, `NOT`
-- Grouping: `( ... )`
+Environment:
+- `OPENBRAIN_EMBED_PROVIDER=noop` (default)  
+- `OPENBRAIN_EMBED_PROVIDER=fake` (deterministic dev/test only)  
+- `OPENBRAIN_EMBED_PROVIDER=openai` (real embeddings)
+
+OpenAI provider env (v0.1):
+- `OPENAI_API_KEY` (required when provider=openai)
+- `OPENAI_EMBED_MODEL` (optional; default: `text-embedding-3-small`)
+- `OPENAI_BASE_URL` (optional)
+- `OPENAI_TIMEOUT_SECS` (optional)
+- `OPENAI_EMBED_DIMS` (optional; if set must be 1536)
+
+> v0.1 uses a fixed embedding dimension of **1536** (pgvector column is `vector(1536)`).
+
+Claude rerank/pack env (v0.1):
+- `ANTHROPIC_API_KEY` (required for rerank/pack)
+- `ANTHROPIC_MODEL` (optional)
+- `ANTHROPIC_BASE_URL` (optional)
+- `ANTHROPIC_TIMEOUT_SECS` (optional)
+
+Claude is used **only** for rerank + memory pack summary. It is **not** an embedding provider.
+
+---
+
+## HTTP API (Implemented)
+
+All endpoints are **POST** and accept/return JSON in a standard envelope.
+
+Success:
+```json
+{ "ok": true, "...": "..." }
+```
+
+Error:
+```json
+{
+  "ok": false,
+  "error": { "code": "OB_INVALID_REQUEST", "message": "...", "details": {} }
+}
+```
+
+### `POST /v1/ping`
+Response:
+```json
+{ "ok": true, "version": "0.1", "server_time": "2026-03-03T10:00:00Z" }
+```
+
+### `POST /v1/write`
+Request:
+```json
+{
+  "objects": [
+    {
+      "type":"claim",
+      "id":"clm_...",
+      "scope":"workspace:nyex",
+      "status":"draft",
+      "spec_version":"0.1",
+      "tags":[],
+      "provenance":{ "actor":"agent:nyex", "ts":"..." },
+      "data":{
+        "subject":{ "entity_id":"ent_..." },
+        "predicate":"requires",
+        "object":{ "value":"MCP HTTP", "entity_id":null },
+        "polarity":"affirm",
+        "confidence":0.8,
+        "evidence":[],
+        "props":{}
+      }
+    }
+  ],
+  "mode":"draft",
+  "idempotency_key":"optional"
+}
+```
+
+### `POST /v1/read` (scoped)
+Request:
+```json
+{ "scope": "workspace:nyex", "refs": ["clm_...", "dec_..."] }
+```
+
+### `POST /v1/search/structured`
+Request:
+```json
+{
+  "scope":"workspace:nyex",
+  "where":"type == \"task\" AND data.state == \"blocked\"",
+  "limit":50,
+  "offset":0,
+  "order_by":"updated_at DESC"
+}
+```
+
+### `POST /v1/embed/generate`
+Request (text):
+```json
+{ "scope":"workspace:nyex", "target": { "text":"routing budget policy" }, "model":"default" }
+```
+
+Request (ref):
+```json
+{ "scope":"workspace:nyex", "target": { "ref":"dec_..." }, "model":"default" }
+```
+
+### `POST /v1/search/semantic`
+Request:
+```json
+{
+  "scope":"workspace:nyex",
+  "query":"routing budget policy",
+  "top_k":10,
+  "model":"default",
+  "filters":"status IN [\"candidate\",\"canonical\"]",
+  "types":["decision","claim"],
+  "status":["candidate","canonical"]
+}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "matches": [
+    { "ref":"dec_...", "kind":"decision", "score":0.83, "updated_at":"2026-03-03T10:05:00Z", "snippet": null }
+  ]
+}
+```
+
+---
+
+## Query DSL (v0.1 implemented)
+
+Supported operators:
+- comparisons: `== != > >= < <=`
+- membership: `IN [..]`
+- boolean: `AND OR NOT`
+- grouping: `( ... )`
+
+Not implemented in v0.1:
+- `~=` (regex match) — disabled (returns `OB_INVALID_REQUEST`)
+- `CONTAINS` — not implemented
 
 Field paths:
-
-- Top-level fields: `type`, `id`, `scope`, `status`, `spec_version`, `created_at`, `updated_at`, `tags`
-- Nested JSON: `data.<field>` and `data.<field>.<subfield>`
+- top-level: `type`, `id`, `scope`, `status`, `spec_version`, `created_at`, `updated_at`, `tags`
+- nested JSON: `data.<path>` (multi-level supported via JSON path)
 - `provenance.ts`
 
-Not implemented (explicit):
+---
 
-- Regex operator `~=`
-- `CONTAINS`
+## Storage schema (Postgres + pgvector)
 
-Invalid syntax returns `OB_INVALID_REQUEST` (with line/col details when available).
+OpenBrain uses:
+- `ob_objects` — typed memory objects (JSONB `data` + `provenance`)
+- `ob_events` — append-only events
+- `ob_embeddings` — embeddings (`vector(1536)`)
 
-## Not implemented (explicit)
+See `migrations/0001_init.sql` for exact DDL + indexes.
 
-These items are **not implemented** (no ambiguity):
+---
 
-- `promote`, `conflicts.list`, timeline APIs, `policy.explain`
-- Auth, remote bind defaults (daemon is local-first)
-- Multi-dim embeddings
-- MCP-over-HTTP transport (stdio only)
+## Development
 
-## Dev
+Local quality gates (source of truth):
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --all-features
+```
 
-See `CONTRIBUTING.md` for:
+DB tests:
+- Use `DATABASE_URL`. If missing, DB-backed tests may skip with a clear message (see `CONTRIBUTING.md`).
 
-- `cargo fmt` / `cargo clippy` / `cargo test`
-- Postgres + pgvector setup
-- HTTP curl examples
+---
+
+## Roadmap (high level)
+
+- IT7B: Claude rerank + Memory Pack Builder
+- IT7C: Local embeddings provider
+- IT8: Expand provider ecosystem + multi-embedding strategy (optional, later)
+
+---
+
+## License
+Apache-2.0 (recommended for wide adoption) or MIT.
+
+Digilabs Company Australia © NYEX AI Platform. All rights reserved. AIC Pty Ltd (ACN 082 378 256)
