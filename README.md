@@ -18,7 +18,7 @@ It stores **typed, versioned memory objects** (claims, decisions, tasks, artifac
 - Query DSL + deterministic structured search
 - Embedding pipeline:
   - canonical text normalization + checksum (`sha256("ob.v0.1\n" + text)`)
-  - embedding dedupe by `(scope, model, checksum)`
+  - embedding dedupe by `(scope, provider, model, kind, checksum)` (provider defaults to `noop`, kind to `semantic`)
   - `embed.generate`
 - Semantic search using pgvector cosine ranking with optional safe DSL filters
 - Local-first daemon:
@@ -30,7 +30,6 @@ It stores **typed, versioned memory objects** (claims, decisions, tasks, artifac
 - Promotion workflow (`promote`), conflict detection (`conflicts.list`), timeline API, policy engine (`policy.explain`)
 - Auth / multi-user / remote deployment defaults (currently local-only)
 - Multi-dim embeddings (v0.2+)
-- Multi-embedding strategy (optional, later; tracked to prevent drift)
 
 ---
 
@@ -238,6 +237,9 @@ Request:
   "query":"routing budget policy",
   "top_k":10,
   "model":"default",
+  "embedding_provider":"noop",
+  "embedding_model":"default",
+  "embedding_kind":"semantic",
   "filters":"status IN [\"candidate\",\"canonical\"]",
   "types":["decision","claim"],
   "status":["candidate","canonical"]
@@ -280,7 +282,7 @@ Field paths:
 OpenBrain uses:
 - `ob_objects` — typed memory objects (JSONB `data` + `provenance`)
 - `ob_events` — append-only events
-- `ob_embeddings` — embeddings (`vector(1536)`)
+- `ob_embeddings` — embeddings (`vector(1536)`), provider + model + kind
 
 See `migrations/0001_init.sql` for exact DDL + indexes.
 

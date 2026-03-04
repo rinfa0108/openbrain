@@ -130,6 +130,9 @@ async fn semantic_search_orders_by_score_and_is_scope_isolated() {
             query,
             top_k: Some(10),
             model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: None,
             types: None,
             status: None,
@@ -186,6 +189,9 @@ async fn semantic_search_applies_filters() {
             query,
             top_k: Some(10),
             model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: Some(r#"type == "decision""#.to_string()),
             types: None,
             status: None,
@@ -253,6 +259,9 @@ async fn semantic_search_top_k_is_capped_to_50() {
             query,
             top_k: Some(500),
             model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: None,
             types: None,
             status: None,
@@ -279,6 +288,9 @@ async fn semantic_search_rejects_invalid_filter() {
             query: "hello".to_string(),
             top_k: None,
             model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: Some("type === \"claim\"".to_string()),
             types: None,
             status: None,
@@ -288,6 +300,112 @@ async fn semantic_search_rejects_invalid_filter() {
     match res {
         Envelope::Ok { .. } => panic!("expected error"),
         Envelope::Err { error, .. } => assert_eq!(error.code, "OB_INVALID_REQUEST"),
+    }
+}
+
+#[tokio::test]
+async fn semantic_search_respects_embedding_provider_selection() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store_a = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "alpha",
+    );
+    let store_b = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "beta",
+    );
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let obj_a = format!("obj-{}", Uuid::new_v4());
+    let obj_b = format!("obj-{}", Uuid::new_v4());
+
+    let data_a = serde_json::json!({"title":"Alpha","outcome":"yes","rationale":"a"});
+    let data_b = serde_json::json!({"title":"Beta","outcome":"no","rationale":"b"});
+
+    let _ = store_a
+        .put_objects(PutObjectsRequest {
+            objects: vec![
+                obj(&obj_a, &scope, "decision", "draft", data_a.clone()),
+                obj(&obj_b, &scope, "decision", "draft", data_b.clone()),
+            ],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let _ = store_a
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Ref {
+                r#ref: obj_a.clone(),
+            },
+            model: "fake-v1".to_string(),
+            dims: None,
+        })
+        .await;
+
+    let _ = store_b
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Ref {
+                r#ref: obj_b.clone(),
+            },
+            model: "fake-v1".to_string(),
+            dims: None,
+        })
+        .await;
+
+    let query = normalize_object_text("decision", &data_a).unwrap();
+
+    let res_alpha = store_a
+        .search_semantic(SearchSemanticRequest {
+            scope: scope.clone(),
+            query: query.clone(),
+            top_k: Some(5),
+            model: None,
+            embedding_provider: Some("alpha".to_string()),
+            embedding_model: Some("fake-v1".to_string()),
+            embedding_kind: None,
+            filters: None,
+            types: None,
+            status: None,
+        })
+        .await;
+
+    match res_alpha {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.matches.is_empty());
+            assert_eq!(data.matches[0].r#ref, obj_a);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    }
+
+    let res_beta = store_a
+        .search_semantic(SearchSemanticRequest {
+            scope: scope.clone(),
+            query,
+            top_k: Some(5),
+            model: None,
+            embedding_provider: Some("beta".to_string()),
+            embedding_model: Some("fake-v1".to_string()),
+            embedding_kind: None,
+            filters: None,
+            types: None,
+            status: None,
+        })
+        .await;
+
+    match res_beta {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.matches.is_empty());
+            assert_eq!(data.matches[0].r#ref, obj_b);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
     }
 }
 
@@ -315,6 +433,9 @@ async fn semantic_search_dims_mismatch_fails() {
             query: "hello".to_string(),
             top_k: None,
             model: Some("bad".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: None,
             types: None,
             status: None,
@@ -342,6 +463,9 @@ async fn semantic_search_large_query_rejected() {
             query: big,
             top_k: None,
             model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
             filters: None,
             types: None,
             status: None,

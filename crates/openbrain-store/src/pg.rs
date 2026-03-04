@@ -22,6 +22,9 @@ const MAX_LIMIT: u32 = 200;
 
 const EMBEDDING_DIMS: i32 = 1536;
 const MAX_EMBED_TEXT_LEN: usize = 32 * 1024;
+const DEFAULT_EMBED_PROVIDER: &str = "noop";
+const DEFAULT_EMBED_KIND: &str = "semantic";
+const DEFAULT_EMBED_MODEL: &str = "default";
 
 fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
     let mut out = String::with_capacity(embedding.len() * 12 + 2);
@@ -47,6 +50,8 @@ fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvel
 pub struct PgStore {
     pool: PgPool,
     embedder: Arc<dyn EmbeddingProvider>,
+    embedding_provider: String,
+    embedding_kind: String,
 }
 
 impl PgStore {
@@ -58,6 +63,8 @@ impl PgStore {
         Ok(Self {
             pool,
             embedder: Arc::new(NoopEmbeddingProvider),
+            embedding_provider: DEFAULT_EMBED_PROVIDER.to_string(),
+            embedding_kind: DEFAULT_EMBED_KIND.to_string(),
         })
     }
 
@@ -65,26 +72,74 @@ impl PgStore {
         database_url: &str,
         embedder: Arc<dyn EmbeddingProvider>,
     ) -> Result<Self, sqlx::Error> {
+        Self::connect_with_embedder_and_provider(database_url, embedder, DEFAULT_EMBED_PROVIDER)
+            .await
+    }
+
+    pub async fn connect_with_embedder_and_provider(
+        database_url: &str,
+        embedder: Arc<dyn EmbeddingProvider>,
+        embedding_provider: &str,
+    ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
             .await?;
-        Ok(Self { pool, embedder })
+        let provider = embedding_provider.trim();
+        let provider = if provider.is_empty() {
+            DEFAULT_EMBED_PROVIDER
+        } else {
+            provider
+        };
+        Ok(Self {
+            pool,
+            embedder,
+            embedding_provider: provider.to_string(),
+            embedding_kind: DEFAULT_EMBED_KIND.to_string(),
+        })
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
             embedder: Arc::new(NoopEmbeddingProvider),
+            embedding_provider: DEFAULT_EMBED_PROVIDER.to_string(),
+            embedding_kind: DEFAULT_EMBED_KIND.to_string(),
         }
     }
 
     pub fn from_pool_with_embedder(pool: PgPool, embedder: Arc<dyn EmbeddingProvider>) -> Self {
-        Self { pool, embedder }
+        Self::from_pool_with_embedder_and_provider(pool, embedder, DEFAULT_EMBED_PROVIDER)
+    }
+
+    pub fn from_pool_with_embedder_and_provider(
+        pool: PgPool,
+        embedder: Arc<dyn EmbeddingProvider>,
+        embedding_provider: &str,
+    ) -> Self {
+        let provider = embedding_provider.trim();
+        let provider = if provider.is_empty() {
+            DEFAULT_EMBED_PROVIDER
+        } else {
+            provider
+        };
+        Self {
+            pool,
+            embedder,
+            embedding_provider: provider.to_string(),
+            embedding_kind: DEFAULT_EMBED_KIND.to_string(),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    fn normalize_opt_field(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
     }
 
     async fn upsert_object(
@@ -1084,14 +1139,23 @@ impl Store for PgStore {
             object_id: Option<String>,
         }
 
+        let provider = self.embedding_provider.as_str();
+        let kind = self.embedding_kind.as_str();
+
         let existing: Option<ExistingRow> = match sqlx::query_as(
             r#"SELECT id, object_id
                FROM ob_embeddings
-               WHERE scope = $1 AND model = $2 AND checksum = $3
+               WHERE scope = $1
+                 AND provider = $2
+                 AND model = $3
+                 AND kind = $4
+                 AND checksum = $5
                LIMIT 1"#,
         )
         .bind(&req.scope)
+        .bind(provider)
         .bind(&req.model)
+        .bind(kind)
         .bind(&checksum)
         .fetch_optional(&self.pool)
         .await
@@ -1153,27 +1217,42 @@ impl Store for PgStore {
             Err(e) => return Envelope::err(e),
         };
 
-        if let Err(e) = sqlx::query(
+        // If an embedding already exists for this object/provider/model/kind, update it (latest wins).
+        let inserted: Result<(String,), sqlx::Error> = sqlx::query_as(
             r#"INSERT INTO ob_embeddings
-               (id, object_id, scope, model, dims, checksum, embedding)
-               VALUES ($1, $2, $3, $4, $5, $6, ($7)::vector)"#,
+               (id, object_id, scope, provider, model, kind, dims, checksum, embedding)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ($9)::vector)
+               ON CONFLICT (scope, object_id, provider, model, kind)
+               WHERE object_id IS NOT NULL
+               DO UPDATE SET
+                 checksum = EXCLUDED.checksum,
+                 dims = EXCLUDED.dims,
+                 embedding = EXCLUDED.embedding,
+                 created_at = now()
+               RETURNING id"#,
         )
         .bind(&embedding_id)
         .bind(object_id.as_deref())
         .bind(&req.scope)
+        .bind(provider)
         .bind(&req.model)
+        .bind(kind)
         .bind(dims)
         .bind(&checksum)
         .bind(&vector_text)
-        .execute(&self.pool)
-        .await
-        {
-            return Envelope::err(ErrorEnvelope::new(
-                ErrorCode::ObStorageError,
-                format!("failed to insert embedding: {e}"),
-                None,
-            ));
-        }
+        .fetch_one(&self.pool)
+        .await;
+
+        let embedding_id = match inserted {
+            Ok((id,)) => id,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("failed to insert embedding: {e}"),
+                    None,
+                ));
+            }
+        };
 
         Envelope::ok(EmbedGenerateResponse {
             embedding_id,
@@ -1205,13 +1284,43 @@ impl Store for PgStore {
 
         let top_k = req.top_k.unwrap_or(10).min(50) as i64;
 
-        let model = req
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("default")
-            .to_string();
+        let provider = Self::normalize_opt_field(req.embedding_provider.as_deref())
+            .unwrap_or_else(|| self.embedding_provider.clone());
+        let model = Self::normalize_opt_field(req.embedding_model.as_deref())
+            .or_else(|| Self::normalize_opt_field(req.model.as_deref()))
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+        let kind = Self::normalize_opt_field(req.embedding_kind.as_deref())
+            .unwrap_or_else(|| self.embedding_kind.clone());
+
+        let has_embeddings: Option<i64> = match sqlx::query_scalar(
+            r#"SELECT 1
+               FROM ob_embeddings
+               WHERE scope = $1
+                 AND provider = $2
+                 AND model = $3
+                 AND kind = $4
+               LIMIT 1"#,
+        )
+        .bind(&req.scope)
+        .bind(&provider)
+        .bind(&model)
+        .bind(&kind)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("semantic search failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        if has_embeddings.is_none() {
+            return Envelope::ok(SearchSemanticResponse { matches: vec![] });
+        }
 
         let normalized_query = match validate_embedding_text(&req.query, MAX_EMBED_TEXT_LEN) {
             Ok(v) => v,
@@ -1273,8 +1382,12 @@ impl Store for PgStore {
         qb.push_bind(&req.scope);
         qb.push(" AND o.scope = ");
         qb.push_bind(&req.scope);
+        qb.push(" AND e.provider = ");
+        qb.push_bind(&provider);
         qb.push(" AND e.model = ");
         qb.push_bind(&model);
+        qb.push(" AND e.kind = ");
+        qb.push_bind(&kind);
         qb.push(" AND e.dims = ");
         qb.push_bind(EMBEDDING_DIMS);
 
