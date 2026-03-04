@@ -76,7 +76,9 @@ async fn connect_store(database_url: Option<String>, embed_provider: String) -> 
 
     let embedder = select_embedder(&embed_provider);
 
-    match PgStore::connect_with_embedder(&database_url, embedder).await {
+    match PgStore::connect_with_embedder_and_provider(&database_url, embedder, &embed_provider)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("failed to connect to postgres: {e}");

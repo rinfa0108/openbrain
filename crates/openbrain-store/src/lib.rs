@@ -89,6 +89,12 @@ pub struct SearchSemanticRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub types: Option<Vec<String>>,

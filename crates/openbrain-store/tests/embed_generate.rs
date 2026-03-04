@@ -101,6 +101,143 @@ async fn embed_generate_text_dedupes_by_scope_model_checksum() {
 }
 
 #[tokio::test]
+async fn embed_generate_is_provider_aware_for_dedupe() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store_a = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "fake-a",
+    );
+    let store_b = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "fake-b",
+    );
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let model = "fake-v1".to_string();
+    let text = "same text across providers".to_string();
+
+    let first = store_a
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Text { text: text.clone() },
+            model: model.clone(),
+            dims: None,
+        })
+        .await;
+
+    let first_id = match first {
+        Envelope::Ok { data, .. } => data.embedding_id,
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    };
+
+    let second_same_provider = store_a
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Text { text: text.clone() },
+            model: model.clone(),
+            dims: None,
+        })
+        .await;
+
+    match second_same_provider {
+        Envelope::Ok { data, .. } => {
+            assert!(data.reused);
+            assert_eq!(data.embedding_id, first_id);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    }
+
+    let third_other_provider = store_b
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Text { text },
+            model: model.clone(),
+            dims: None,
+        })
+        .await;
+
+    let third_id = match third_other_provider {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.reused);
+            data.embedding_id
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    };
+
+    assert_ne!(first_id, third_id);
+
+    let count: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM ob_embeddings WHERE scope = $1 AND model = $2"#)
+            .bind(&scope)
+            .bind(&model)
+            .fetch_one(&pool)
+            .await
+            .expect("count embeddings");
+
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn embed_generate_allows_multiple_providers_for_same_object() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store_a = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "fake-a",
+    );
+    let store_b = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "fake-b",
+    );
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let id = format!("obj-{}", Uuid::new_v4());
+
+    let _ = store_a
+        .put_objects(PutObjectsRequest {
+            objects: vec![obj_claim(&id, &scope)],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    for store in [&store_a, &store_b] {
+        let res = store
+            .embed_generate(EmbedGenerateRequest {
+                scope: scope.clone(),
+                target: EmbedTarget::Ref { r#ref: id.clone() },
+                model: "fake-v1".to_string(),
+                dims: None,
+            })
+            .await;
+        match res {
+            Envelope::Ok { data, .. } => assert_eq!(data.object_id.as_deref(), Some(id.as_str())),
+            Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+        }
+    }
+
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM ob_embeddings WHERE scope = $1 AND object_id = $2"#,
+    )
+    .bind(&scope)
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("count embeddings");
+
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn embed_generate_ref_stores_object_id() {
     let Some(pool) = setup_pool().await else {
         return;
