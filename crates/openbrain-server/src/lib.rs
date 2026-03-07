@@ -1,16 +1,18 @@
 use axum::{
     body::Bytes,
     extract::{rejection::BytesRejection, DefaultBodyLimit, State},
+    http::HeaderMap,
     response::IntoResponse,
     routing::post,
     Json, Router,
 };
 use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope};
 use openbrain_llm::AnthropicClient;
+pub mod auth;
 pub mod service;
 use openbrain_store::{
-    EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
-    SearchStructuredRequest, Store,
+    AuthStore, EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
+    SearchStructuredRequest, Store, TokenCreateRequest, TokenCreateResponse, WorkspaceRole,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -32,7 +34,7 @@ pub struct PingResponse {
 
 pub fn build_router<S>(state: AppState<S>) -> Router
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
     Router::new()
         .route("/v1/ping", post(ping))
@@ -43,6 +45,10 @@ where
         .route("/v1/search/semantic", post(search_semantic::<S>))
         .route("/v1/rerank", post(rerank::<S>))
         .route("/v1/memory/pack", post(memory_pack::<S>))
+        .route(
+            "/v1/workspace/token/create",
+            post(workspace_token_create::<S>),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -92,17 +98,6 @@ where
     })
 }
 
-fn validate_scope(scope: &str) -> Result<(), ErrorEnvelope> {
-    if scope.trim().is_empty() {
-        return Err(ErrorEnvelope::new(
-            ErrorCode::ObScopeRequired,
-            "scope is required",
-            None,
-        ));
-    }
-    Ok(())
-}
-
 async fn ping(body: Result<Bytes, BytesRejection>) -> impl IntoResponse {
     if let Err(e) = body {
         return Json(err::<PingResponse>(
@@ -121,15 +116,28 @@ async fn ping(body: Result<Bytes, BytesRejection>) -> impl IntoResponse {
 
 async fn write<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Write) {
+        return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<PutObjectsRequest>(body) {
         Ok(v) => v,
         Err(e) => return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e)),
     };
+
+    if let Err(e) = auth::ensure_object_scopes(&auth, &req.objects) {
+        return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e));
+    }
 
     Json(state.store.put_objects(req).await)
 }
@@ -138,27 +146,57 @@ where
 struct ReadRequest {
     pub scope: String,
     pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_states: Option<Vec<openbrain_core::LifecycleState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_expired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct WorkspaceTokenCreateRequest {
+    pub role: WorkspaceRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 async fn read<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<openbrain_store::GetObjectsResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Read) {
+        return Json::<Envelope<openbrain_store::GetObjectsResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<ReadRequest>(body) {
         Ok(v) => v,
         Err(e) => return Json::<Envelope<openbrain_store::GetObjectsResponse>>(Envelope::err(e)),
     };
 
-    if let Err(e) = validate_scope(&req.scope) {
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
         return Json::<Envelope<openbrain_store::GetObjectsResponse>>(Envelope::err(e));
     }
 
     let resp = state
         .store
-        .get_objects(GetObjectsRequest { refs: req.refs })
+        .get_objects(GetObjectsRequest {
+            scope: req.scope.clone(),
+            refs: req.refs,
+            include_states: req.include_states,
+            include_expired: req.include_expired,
+            now: req.now,
+        })
         .await;
 
     match resp {
@@ -186,11 +224,22 @@ where
 
 async fn search_structured<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json::<Envelope<openbrain_store::SearchStructuredResponse>>(Envelope::err(e))
+        }
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Search) {
+        return Json::<Envelope<openbrain_store::SearchStructuredResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<SearchStructuredRequest>(body) {
         Ok(v) => v,
         Err(e) => {
@@ -198,7 +247,7 @@ where
         }
     };
 
-    if let Err(e) = validate_scope(&req.scope) {
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
         return Json::<Envelope<openbrain_store::SearchStructuredResponse>>(Envelope::err(e));
     }
 
@@ -207,11 +256,22 @@ where
 
 async fn embed_generate<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json::<Envelope<openbrain_store::EmbedGenerateResponse>>(Envelope::err(e))
+        }
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Write) {
+        return Json::<Envelope<openbrain_store::EmbedGenerateResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<EmbedGenerateRequest>(body) {
         Ok(v) => v,
         Err(e) => {
@@ -219,7 +279,7 @@ where
         }
     };
 
-    if let Err(e) = validate_scope(&req.scope) {
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
         return Json::<Envelope<openbrain_store::EmbedGenerateResponse>>(Envelope::err(e));
     }
 
@@ -228,11 +288,22 @@ where
 
 async fn search_semantic<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json::<Envelope<openbrain_store::SearchSemanticResponse>>(Envelope::err(e))
+        }
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Search) {
+        return Json::<Envelope<openbrain_store::SearchSemanticResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<SearchSemanticRequest>(body) {
         Ok(v) => v,
         Err(e) => {
@@ -240,7 +311,7 @@ where
         }
     };
 
-    if let Err(e) = validate_scope(&req.scope) {
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
         return Json::<Envelope<openbrain_store::SearchSemanticResponse>>(Envelope::err(e));
     }
 
@@ -249,30 +320,93 @@ where
 
 async fn rerank<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<service::RerankResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Search) {
+        return Json::<Envelope<service::RerankResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<service::RerankRequest>(body) {
         Ok(v) => v,
         Err(e) => return Json::<Envelope<service::RerankResponse>>(Envelope::err(e)),
     };
+
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
+        return Json::<Envelope<service::RerankResponse>>(Envelope::err(e));
+    }
 
     Json(service::rerank(&state.store, &state.llm, req).await)
 }
 
 async fn memory_pack<S>(
     State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Search) {
+        return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e));
+    }
+
     let req = match parse_json_body::<service::MemoryPackRequest>(body) {
         Ok(v) => v,
         Err(e) => return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e)),
     };
 
+    if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
+        return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e));
+    }
+
     Json(service::build_pack(&state.store, &state.llm, req).await)
+}
+
+async fn workspace_token_create<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + AuthStore + Clone + 'static,
+{
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<TokenCreateResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Admin) {
+        return Json::<Envelope<TokenCreateResponse>>(Envelope::err(e));
+    }
+
+    let req = match parse_json_body::<WorkspaceTokenCreateRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<TokenCreateResponse>>(Envelope::err(e)),
+    };
+
+    let resp = state
+        .store
+        .create_token(TokenCreateRequest {
+            workspace_id: auth.workspace_id.clone(),
+            role: req.role,
+            label: req.label,
+            display_name: req.display_name,
+        })
+        .await;
+
+    match resp {
+        Ok(v) => Json(Envelope::ok(v)),
+        Err(e) => Json(Envelope::err(e)),
+    }
 }

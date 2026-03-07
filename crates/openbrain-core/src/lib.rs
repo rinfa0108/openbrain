@@ -6,6 +6,40 @@ pub mod textnorm;
 
 pub const SPEC_VERSION: &str = "0.1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LifecycleState {
+    Scratch,
+    Candidate,
+    Accepted,
+    Deprecated,
+}
+
+impl LifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scratch => "scratch",
+            Self::Candidate => "candidate",
+            Self::Accepted => "accepted",
+            Self::Deprecated => "deprecated",
+        }
+    }
+}
+
+impl std::str::FromStr for LifecycleState {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "scratch" => Ok(Self::Scratch),
+            "candidate" => Ok(Self::Candidate),
+            "accepted" => Ok(Self::Accepted),
+            "deprecated" => Ok(Self::Deprecated),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -13,6 +47,8 @@ pub enum ErrorCode {
     ObInvalidSchema,
     ObUnsupportedVersion,
     ObScopeRequired,
+    ObUnauthenticated,
+    ObForbidden,
     ObNotFound,
     ObConflict,
     ObStorageError,
@@ -27,6 +63,8 @@ impl ErrorCode {
             Self::ObInvalidSchema => "OB_INVALID_SCHEMA",
             Self::ObUnsupportedVersion => "OB_UNSUPPORTED_VERSION",
             Self::ObScopeRequired => "OB_SCOPE_REQUIRED",
+            Self::ObUnauthenticated => "OB_UNAUTHENTICATED",
+            Self::ObForbidden => "OB_FORBIDDEN",
             Self::ObNotFound => "OB_NOT_FOUND",
             Self::ObConflict => "OB_CONFLICT",
             Self::ObStorageError => "OB_STORAGE_ERROR",
@@ -90,6 +128,12 @@ pub struct MemoryObject {
     pub tags: Option<Vec<String>>,
     pub data: Option<Value>,
     pub provenance: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<LifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_key: Option<String>,
 }
 
 impl MemoryObject {
@@ -175,6 +219,19 @@ impl MemoryObject {
         })?;
 
         let tags = self.tags.clone().unwrap_or_default();
+        let lifecycle_state = self.lifecycle_state.unwrap_or(LifecycleState::Accepted);
+        let expires_at = self
+            .expires_at
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let memory_key = self
+            .memory_key
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         Ok(ValidatedMemoryObject {
             object_type,
@@ -185,6 +242,9 @@ impl MemoryObject {
             tags,
             data,
             provenance,
+            lifecycle_state,
+            expires_at,
+            memory_key,
         })
     }
 }
@@ -199,6 +259,9 @@ pub struct ValidatedMemoryObject {
     pub tags: Vec<String>,
     pub data: Value,
     pub provenance: Value,
+    pub lifecycle_state: LifecycleState,
+    pub expires_at: Option<String>,
+    pub memory_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +278,11 @@ pub struct MemoryObjectStored {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub lifecycle_state: LifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -235,4 +303,50 @@ pub enum ObjectStatus {
     Canonical,
     Deprecated,
     Superseded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_state_defaults_to_accepted() {
+        let obj = MemoryObject {
+            object_type: Some("claim".to_string()),
+            id: Some("obj-1".to_string()),
+            scope: Some("scope-1".to_string()),
+            status: Some("draft".to_string()),
+            spec_version: Some(SPEC_VERSION.to_string()),
+            tags: Some(vec![]),
+            data: Some(serde_json::json!({"k": "v"})),
+            provenance: Some(serde_json::json!({"actor": "tester"})),
+            lifecycle_state: None,
+            expires_at: None,
+            memory_key: None,
+        };
+
+        let validated = obj.validate().expect("valid");
+        assert_eq!(validated.lifecycle_state, LifecycleState::Accepted);
+    }
+
+    #[test]
+    fn lifecycle_state_parsing_accepts_known_values() {
+        use std::str::FromStr;
+        assert_eq!(
+            LifecycleState::from_str("scratch").ok(),
+            Some(LifecycleState::Scratch)
+        );
+        assert_eq!(
+            LifecycleState::from_str("candidate").ok(),
+            Some(LifecycleState::Candidate)
+        );
+        assert_eq!(
+            LifecycleState::from_str("accepted").ok(),
+            Some(LifecycleState::Accepted)
+        );
+        assert_eq!(
+            LifecycleState::from_str("deprecated").ok(),
+            Some(LifecycleState::Deprecated)
+        );
+    }
 }

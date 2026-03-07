@@ -46,6 +46,9 @@ fn obj_claim(id: &str, scope: &str) -> MemoryObject {
             "polarity": "pos"
         })),
         provenance: Some(serde_json::json!({"actor":"tester"})),
+        lifecycle_state: None,
+        expires_at: None,
+        memory_key: None,
     }
 }
 

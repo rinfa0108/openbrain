@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use openbrain_core::textnorm::normalize_object_text;
-use openbrain_core::{Envelope, MemoryObject};
+use openbrain_core::{Envelope, LifecycleState, MemoryObject};
 use openbrain_embed::{EmbedError, EmbeddingProvider, FakeEmbeddingProvider};
 use openbrain_store::{
     EmbedGenerateRequest, EmbedTarget, PgStore, PutObjectsRequest, SearchSemanticRequest, Store,
@@ -51,6 +51,33 @@ fn obj(
         tags: Some(vec![]),
         data: Some(data),
         provenance: Some(serde_json::json!({"actor":"tester"})),
+        lifecycle_state: None,
+        expires_at: None,
+        memory_key: None,
+    }
+}
+
+fn obj_with_lifecycle(
+    id: &str,
+    scope: &str,
+    object_type: &str,
+    status: &str,
+    lifecycle_state: LifecycleState,
+    memory_key: Option<&str>,
+    data: serde_json::Value,
+) -> MemoryObject {
+    MemoryObject {
+        object_type: Some(object_type.to_string()),
+        id: Some(id.to_string()),
+        scope: Some(scope.to_string()),
+        status: Some(status.to_string()),
+        spec_version: Some("0.1".to_string()),
+        tags: Some(vec![]),
+        data: Some(data),
+        provenance: Some(serde_json::json!({"actor":"tester"})),
+        lifecycle_state: Some(lifecycle_state),
+        expires_at: None,
+        memory_key: memory_key.map(|s| s.to_string()),
     }
 }
 
@@ -136,6 +163,9 @@ async fn semantic_search_orders_by_score_and_is_scope_isolated() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -195,6 +225,9 @@ async fn semantic_search_applies_filters() {
             filters: Some(r#"type == "decision""#.to_string()),
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -265,6 +298,9 @@ async fn semantic_search_top_k_is_capped_to_50() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -294,6 +330,9 @@ async fn semantic_search_rejects_invalid_filter() {
             filters: Some("type === \"claim\"".to_string()),
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -374,6 +413,9 @@ async fn semantic_search_respects_embedding_provider_selection() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -397,6 +439,9 @@ async fn semantic_search_respects_embedding_provider_selection() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -486,6 +531,9 @@ async fn semantic_search_respects_embedding_model_selection() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -509,6 +557,9 @@ async fn semantic_search_respects_embedding_model_selection() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -551,6 +602,9 @@ async fn semantic_search_dims_mismatch_fails() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -581,11 +635,101 @@ async fn semantic_search_large_query_rejected() {
             filters: None,
             types: None,
             status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
     match res {
         Envelope::Ok { .. } => panic!("expected error"),
         Envelope::Err { error, .. } => assert_eq!(error.code, "OB_INVALID_REQUEST"),
+    }
+}
+
+#[tokio::test]
+async fn semantic_search_surfaces_conflicts() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store = PgStore::from_pool_with_embedder(pool, Arc::new(FakeEmbeddingProvider));
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let key = "fact:db_provider";
+
+    let id_a = format!("obj-{}", Uuid::new_v4());
+    let id_b = format!("obj-{}", Uuid::new_v4());
+
+    let data_a = serde_json::json!({"title":"Decision A","outcome":"yes","rationale":"a"});
+    let data_b = serde_json::json!({"title":"Decision B","outcome":"no","rationale":"b"});
+
+    seed_object_and_embedding(
+        &store,
+        &scope,
+        &id_a,
+        obj_with_lifecycle(
+            &id_a,
+            &scope,
+            "decision",
+            "draft",
+            LifecycleState::Accepted,
+            Some(key),
+            data_a.clone(),
+        ),
+    )
+    .await;
+    seed_object_and_embedding(
+        &store,
+        &scope,
+        &id_b,
+        obj_with_lifecycle(
+            &id_b,
+            &scope,
+            "decision",
+            "draft",
+            LifecycleState::Accepted,
+            Some(key),
+            data_b.clone(),
+        ),
+    )
+    .await;
+
+    let query = normalize_object_text("decision", &data_a).unwrap();
+
+    let res = store
+        .search_semantic(SearchSemanticRequest {
+            scope: scope.clone(),
+            query,
+            top_k: Some(10),
+            model: Some("fake-v1".to_string()),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
+            filters: None,
+            types: None,
+            status: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
+        })
+        .await;
+
+    match res {
+        Envelope::Ok { data, .. } => {
+            let mut saw_a = false;
+            let mut saw_b = false;
+            for m in data.matches {
+                if m.r#ref == id_a {
+                    saw_a = true;
+                    assert!(m.conflict);
+                }
+                if m.r#ref == id_b {
+                    saw_b = true;
+                    assert!(m.conflict);
+                }
+            }
+            assert!(saw_a && saw_b);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
     }
 }

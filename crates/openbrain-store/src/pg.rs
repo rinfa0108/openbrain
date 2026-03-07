@@ -1,20 +1,24 @@
 use async_trait::async_trait;
 use openbrain_core::query::{parse_where, CmpOp, Expr, FieldPath, Literal, Predicate};
-use openbrain_core::textnorm::{checksum_v01, normalize_object_text, validate_embedding_text};
+use openbrain_core::textnorm::{
+    checksum_v01, normalize_object_text, validate_embedding_text, value_hash_v01,
+};
 use openbrain_core::{
-    Envelope, ErrorCode, ErrorEnvelope, MemoryObjectStored, ValidatedMemoryObject,
+    Envelope, ErrorCode, ErrorEnvelope, LifecycleState, MemoryObjectStored, ValidatedMemoryObject,
 };
 use openbrain_embed::{EmbedError, EmbeddingProvider, NoopEmbeddingProvider};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
-    GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
-    SearchMatch, SearchSemanticRequest, SearchSemanticResponse, SearchStructuredRequest,
-    SearchStructuredResponse, Store,
+    AuthContext, AuthStore, BootstrapToken, EmbedGenerateRequest, EmbedGenerateResponse,
+    EmbedTarget, GetObjectsRequest, GetObjectsResponse, OrderBySpec, PutObjectsRequest,
+    PutObjectsResponse, PutResult, SearchItem, SearchMatch, SearchSemanticRequest,
+    SearchSemanticResponse, SearchStructuredRequest, SearchStructuredResponse, Store,
+    TokenCreateRequest, TokenCreateResponse, WorkspaceRole,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -25,6 +29,8 @@ const MAX_EMBED_TEXT_LEN: usize = 32 * 1024;
 const DEFAULT_EMBED_PROVIDER: &str = "noop";
 const DEFAULT_EMBED_KIND: &str = "semantic";
 const DEFAULT_EMBED_MODEL: &str = "default";
+const DEFAULT_WORKSPACE_ID: &str = "default";
+const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 
 fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
     let mut out = String::with_capacity(embedding.len() * 12 + 2);
@@ -142,10 +148,104 @@ impl PgStore {
             .map(|s| s.to_string())
     }
 
+    fn parse_datetime(
+        label: &str,
+        value: &str,
+    ) -> Result<chrono::DateTime<chrono::Utc>, ErrorEnvelope> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|_| {
+                ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    format!("invalid {label} timestamp"),
+                    Some(serde_json::json!({ "value": value })),
+                )
+            })
+    }
+
+    fn parse_datetime_opt(
+        label: &str,
+        value: Option<&str>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ErrorEnvelope> {
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(Self::parse_datetime(label, v)?)),
+        }
+    }
+
+    fn states_or_default(states: Option<Vec<LifecycleState>>) -> Vec<LifecycleState> {
+        states.unwrap_or_else(|| vec![LifecycleState::Accepted])
+    }
+
+    fn to_state_strings(states: &[LifecycleState]) -> Vec<String> {
+        states.iter().map(|s| s.as_str().to_string()).collect()
+    }
+
+    async fn load_conflicts(
+        &self,
+        scope: &str,
+        memory_keys: &[String],
+        state_strings: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<std::collections::HashMap<String, ConflictInfo>, ErrorEnvelope> {
+        if memory_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct ConflictRow {
+            memory_key: String,
+            distinct_count: i64,
+            total_count: i64,
+            ids: Vec<String>,
+        }
+
+        let rows: Vec<ConflictRow> = sqlx::query_as(
+            r#"SELECT memory_key,
+                      COUNT(DISTINCT value_hash) AS distinct_count,
+                      COUNT(*) AS total_count,
+                      ARRAY_AGG(id) AS ids
+               FROM ob_objects
+               WHERE scope = $1
+                 AND memory_key = ANY($2)
+                 AND lifecycle_state = ANY($3)
+                 AND (expires_at IS NULL OR expires_at > $4)
+               GROUP BY memory_key"#,
+        )
+        .bind(scope)
+        .bind(memory_keys)
+        .bind(state_strings)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("conflict lookup failed: {e}"),
+                None,
+            )
+        })?;
+
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            out.insert(
+                row.memory_key.clone(),
+                ConflictInfo {
+                    distinct_count: row.distinct_count,
+                    total_count: row.total_count,
+                    ids: row.ids,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     async fn upsert_object(
         tx: &mut Transaction<'_, Postgres>,
         obj: &ValidatedMemoryObject,
-    ) -> Result<i64, sqlx::Error> {
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        value_hash: Option<String>,
+    ) -> Result<i64, ErrorEnvelope> {
         let existing = sqlx::query(
             r#"SELECT version
                FROM ob_objects
@@ -154,14 +254,22 @@ impl PgStore {
         )
         .bind(&obj.id)
         .fetch_optional(&mut **tx)
-        .await?;
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("object lookup failed: {e}"),
+                None,
+            )
+        })?;
 
         match existing {
             None => {
                 let version: i64 = sqlx::query_scalar(
                     r#"INSERT INTO ob_objects
-                       (id, scope, type, status, spec_version, tags, data, provenance, version)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+                       (id, scope, type, status, spec_version, tags, data, provenance, version,
+                        lifecycle_state, expires_at, memory_key, value_hash)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12)
                        RETURNING version"#,
                 )
                 .bind(&obj.id)
@@ -172,12 +280,29 @@ impl PgStore {
                 .bind(&obj.tags)
                 .bind(sqlx::types::Json(&obj.data))
                 .bind(sqlx::types::Json(&obj.provenance))
+                .bind(obj.lifecycle_state.as_str())
+                .bind(expires_at)
+                .bind(obj.memory_key.as_deref())
+                .bind(value_hash)
                 .fetch_one(&mut **tx)
-                .await?;
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("object insert failed: {e}"),
+                        None,
+                    )
+                })?;
                 Ok(version)
             }
             Some(row) => {
-                let current_version: i64 = row.try_get("version")?;
+                let current_version: i64 = row.try_get("version").map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("object version read failed: {e}"),
+                        None,
+                    )
+                })?;
                 let new_version = current_version + 1;
                 let version: i64 = sqlx::query_scalar(
                     r#"UPDATE ob_objects
@@ -189,6 +314,10 @@ impl PgStore {
                            data = $7,
                            provenance = $8,
                            version = $9,
+                           lifecycle_state = $10,
+                           expires_at = $11,
+                           memory_key = $12,
+                           value_hash = $13,
                            updated_at = now()
                        WHERE id = $1
                        RETURNING version"#,
@@ -202,8 +331,19 @@ impl PgStore {
                 .bind(sqlx::types::Json(&obj.data))
                 .bind(sqlx::types::Json(&obj.provenance))
                 .bind(new_version)
+                .bind(obj.lifecycle_state.as_str())
+                .bind(expires_at)
+                .bind(obj.memory_key.as_deref())
+                .bind(value_hash)
                 .fetch_one(&mut **tx)
-                .await?;
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("object update failed: {e}"),
+                        None,
+                    )
+                })?;
                 Ok(version)
             }
         }
@@ -239,6 +379,13 @@ enum FieldType {
     Tags,
 }
 
+#[derive(Debug, Clone)]
+struct ConflictInfo {
+    distinct_count: i64,
+    total_count: i64,
+    ids: Vec<String>,
+}
+
 fn field_to_sql(field: &FieldPath) -> Result<(String, FieldType), ErrorEnvelope> {
     let segs = &field.segments;
     if segs.is_empty() {
@@ -257,6 +404,9 @@ fn field_to_sql(field: &FieldPath) -> Result<(String, FieldType), ErrorEnvelope>
         "spec_version" => Ok(("spec_version".to_string(), FieldType::Text)),
         "created_at" => Ok(("created_at".to_string(), FieldType::Timestamp)),
         "updated_at" => Ok(("updated_at".to_string(), FieldType::Timestamp)),
+        "lifecycle_state" => Ok(("lifecycle_state".to_string(), FieldType::Text)),
+        "expires_at" => Ok(("expires_at".to_string(), FieldType::Timestamp)),
+        "memory_key" => Ok(("memory_key".to_string(), FieldType::Text)),
         "tags" => {
             if segs.len() != 1 {
                 return Err(ErrorEnvelope::new(
@@ -524,6 +674,9 @@ fn field_to_sql_with_alias(
         "spec_version" => Ok((col("spec_version"), FieldType::Text)),
         "created_at" => Ok((col("created_at"), FieldType::Timestamp)),
         "updated_at" => Ok((col("updated_at"), FieldType::Timestamp)),
+        "lifecycle_state" => Ok((col("lifecycle_state"), FieldType::Text)),
+        "expires_at" => Ok((col("expires_at"), FieldType::Timestamp)),
+        "memory_key" => Ok((col("memory_key"), FieldType::Text)),
         "tags" => {
             if segs.len() != 1 {
                 return Err(ErrorEnvelope::new(
@@ -818,17 +971,27 @@ impl Store for PgStore {
                 .or_else(|| req.actor.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let version = match Self::upsert_object(&mut tx, &validated).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    return Envelope::err(ErrorEnvelope::new(
-                        ErrorCode::ObStorageError,
-                        format!("write failed: {e}"),
-                        None,
-                    ));
-                }
-            };
+            let expires_at =
+                match Self::parse_datetime_opt("expires_at", validated.expires_at.as_deref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        return Envelope::err(e);
+                    }
+                };
+            let value_hash = validated
+                .memory_key
+                .as_ref()
+                .map(|_| value_hash_v01(&validated.data));
+
+            let version =
+                match Self::upsert_object(&mut tx, &validated, expires_at, value_hash).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        return Envelope::err(e);
+                    }
+                };
 
             let payload = serde_json::json!({
                 "ref": validated.id,
@@ -881,6 +1044,30 @@ impl Store for PgStore {
                 None,
             ));
         }
+        if req.scope.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObScopeRequired,
+                "scope is required",
+                None,
+            ));
+        }
+
+        let include_states = Self::states_or_default(req.include_states.clone());
+        if include_states.is_empty() {
+            return Envelope::ok(GetObjectsResponse { objects: vec![] });
+        }
+        let include_expired = req.include_expired.unwrap_or(false);
+        let now = match Self::parse_datetime_opt("now", req.now.as_deref()) {
+            Ok(Some(v)) => v,
+            Ok(None) => chrono::Utc::now(),
+            Err(e) => return Envelope::err(e),
+        };
+        let now = if include_expired {
+            chrono::DateTime::<chrono::Utc>::MIN_UTC
+        } else {
+            now
+        };
+        let state_strings = Self::to_state_strings(&include_states);
 
         #[derive(sqlx::FromRow)]
         struct ObRow {
@@ -895,6 +1082,9 @@ impl Store for PgStore {
             version: i64,
             created_at: chrono::DateTime<chrono::Utc>,
             updated_at: chrono::DateTime<chrono::Utc>,
+            lifecycle_state: String,
+            expires_at: Option<chrono::DateTime<chrono::Utc>>,
+            memory_key: Option<String>,
         }
 
         let rows: Vec<ObRow> = match sqlx::query_as(
@@ -908,11 +1098,20 @@ impl Store for PgStore {
                       provenance,
                       version,
                       created_at,
-                      updated_at
+                      updated_at,
+                      lifecycle_state,
+                      expires_at,
+                      memory_key
                FROM ob_objects
-               WHERE id = ANY($1)"#,
+               WHERE id = ANY($1)
+                 AND scope = $2
+                 AND lifecycle_state = ANY($3)
+                 AND (expires_at IS NULL OR expires_at > $4)"#,
         )
         .bind(&req.refs)
+        .bind(&req.scope)
+        .bind(state_strings)
+        .bind(now)
         .fetch_all(&self.pool)
         .await
         {
@@ -942,6 +1141,12 @@ impl Store for PgStore {
                     version: r.version,
                     created_at: r.created_at.to_rfc3339(),
                     updated_at: r.updated_at.to_rfc3339(),
+                    lifecycle_state: match lifecycle_from_row(&r.lifecycle_state) {
+                        Ok(v) => v,
+                        Err(e) => return Envelope::err(e),
+                    },
+                    expires_at: r.expires_at.map(|dt| dt.to_rfc3339()),
+                    memory_key: r.memory_key,
                 },
             );
         }
@@ -979,6 +1184,23 @@ impl Store for PgStore {
             ));
         }
 
+        let include_states = Self::states_or_default(req.include_states.clone());
+        if include_states.is_empty() {
+            return Envelope::ok(SearchStructuredResponse { results: vec![] });
+        }
+        let include_expired = req.include_expired.unwrap_or(false);
+        let now = match Self::parse_datetime_opt("now", req.now.as_deref()) {
+            Ok(Some(v)) => v,
+            Ok(None) => chrono::Utc::now(),
+            Err(e) => return Envelope::err(e),
+        };
+        let now = if include_expired {
+            chrono::DateTime::<chrono::Utc>::MIN_UTC
+        } else {
+            now
+        };
+        let state_strings = Self::to_state_strings(&include_states);
+
         let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as i64;
         let offset = req.offset.unwrap_or(0) as i64;
 
@@ -996,9 +1218,15 @@ impl Store for PgStore {
         };
 
         let mut qb = QueryBuilder::new(
-            "SELECT id, type, status, updated_at, version FROM ob_objects WHERE scope = ",
+            "SELECT id, type, status, updated_at, version, memory_key FROM ob_objects WHERE scope = ",
         );
         qb.push_bind(&req.scope);
+        qb.push(" AND lifecycle_state = ANY(");
+        qb.push_bind(state_strings.clone());
+        qb.push(")");
+        qb.push(" AND (expires_at IS NULL OR expires_at > ");
+        qb.push_bind(now);
+        qb.push(")");
 
         if let Some(e) = &expr {
             qb.push(" AND ");
@@ -1021,6 +1249,7 @@ impl Store for PgStore {
             status: String,
             updated_at: chrono::DateTime<chrono::Utc>,
             version: i64,
+            memory_key: Option<String>,
         }
 
         let rows: Vec<SearchRow> = match qb.build_query_as().fetch_all(&self.pool).await {
@@ -1034,14 +1263,41 @@ impl Store for PgStore {
             }
         };
 
+        let memory_keys: Vec<String> = rows.iter().filter_map(|r| r.memory_key.clone()).collect();
+        let conflict_map = match self
+            .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+
         let results = rows
             .into_iter()
-            .map(|r| SearchItem {
-                r#ref: r.id,
-                object_type: r.r#type,
-                status: r.status,
-                updated_at: r.updated_at.to_rfc3339(),
-                version: r.version,
+            .map(|r| {
+                let (conflict, conflict_count, conflicting_object_ids) =
+                    match r.memory_key.as_ref().and_then(|k| conflict_map.get(k)) {
+                        Some(info) if info.distinct_count > 1 => {
+                            let mut ids: Vec<String> =
+                                info.ids.iter().filter(|id| *id != &r.id).cloned().collect();
+                            if ids.len() > 10 {
+                                ids.truncate(10);
+                            }
+                            (true, Some(info.total_count as u32), Some(ids))
+                        }
+                        _ => (false, None, None),
+                    };
+
+                SearchItem {
+                    r#ref: r.id,
+                    object_type: r.r#type,
+                    status: r.status,
+                    updated_at: r.updated_at.to_rfc3339(),
+                    version: r.version,
+                    conflict,
+                    conflict_count,
+                    conflicting_object_ids,
+                }
             })
             .collect();
 
@@ -1282,6 +1538,23 @@ impl Store for PgStore {
             ));
         }
 
+        let include_states = Self::states_or_default(req.include_states.clone());
+        if include_states.is_empty() {
+            return Envelope::ok(SearchSemanticResponse { matches: vec![] });
+        }
+        let include_expired = req.include_expired.unwrap_or(false);
+        let now = match Self::parse_datetime_opt("now", req.now.as_deref()) {
+            Ok(Some(v)) => v,
+            Ok(None) => chrono::Utc::now(),
+            Err(e) => return Envelope::err(e),
+        };
+        let now = if include_expired {
+            chrono::DateTime::<chrono::Utc>::MIN_UTC
+        } else {
+            now
+        };
+        let state_strings = Self::to_state_strings(&include_states);
+
         let top_k = req.top_k.unwrap_or(10).min(50) as i64;
 
         let provider = Self::normalize_opt_field(req.embedding_provider.as_deref())
@@ -1374,7 +1647,7 @@ impl Store for PgStore {
             "SELECT o.id as ref, o.type as kind, (1.0 - (e.embedding <=> (",
         );
         qb.push_bind(&vector_text);
-        qb.push(")::vector))::float4 as score, o.updated_at::text as updated_at ");
+        qb.push(")::vector))::float4 as score, o.updated_at::text as updated_at, o.memory_key as memory_key ");
         qb.push("FROM ob_embeddings e ");
         qb.push("JOIN ob_objects o ON o.id = e.object_id ");
         qb.push("WHERE e.object_id IS NOT NULL ");
@@ -1382,6 +1655,12 @@ impl Store for PgStore {
         qb.push_bind(&req.scope);
         qb.push(" AND o.scope = ");
         qb.push_bind(&req.scope);
+        qb.push(" AND o.lifecycle_state = ANY(");
+        qb.push_bind(state_strings.clone());
+        qb.push(")");
+        qb.push(" AND (o.expires_at IS NULL OR o.expires_at > ");
+        qb.push_bind(now);
+        qb.push(")");
         qb.push(" AND e.provider = ");
         qb.push_bind(&provider);
         qb.push(" AND e.model = ");
@@ -1428,6 +1707,7 @@ impl Store for PgStore {
             kind: String,
             score: f32,
             updated_at: String,
+            memory_key: Option<String>,
         }
 
         let rows: Vec<RowOut> = match qb.build_query_as().fetch_all(&self.pool).await {
@@ -1441,14 +1721,45 @@ impl Store for PgStore {
             }
         };
 
+        let memory_keys: Vec<String> = rows.iter().filter_map(|r| r.memory_key.clone()).collect();
+        let conflict_map = match self
+            .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+
         let matches = rows
             .into_iter()
-            .map(|r| SearchMatch {
-                r#ref: r.r#ref,
-                kind: r.kind,
-                score: r.score,
-                updated_at: r.updated_at,
-                snippet: None,
+            .map(|r| {
+                let (conflict, conflict_count, conflicting_object_ids) =
+                    match r.memory_key.as_ref().and_then(|k| conflict_map.get(k)) {
+                        Some(info) if info.distinct_count > 1 => {
+                            let mut ids: Vec<String> = info
+                                .ids
+                                .iter()
+                                .filter(|id| *id != &r.r#ref)
+                                .cloned()
+                                .collect();
+                            if ids.len() > 10 {
+                                ids.truncate(10);
+                            }
+                            (true, Some(info.total_count as u32), Some(ids))
+                        }
+                        _ => (false, None, None),
+                    };
+
+                SearchMatch {
+                    r#ref: r.r#ref,
+                    kind: r.kind,
+                    score: r.score,
+                    updated_at: r.updated_at,
+                    snippet: None,
+                    conflict,
+                    conflict_count,
+                    conflicting_object_ids,
+                }
             })
             .collect();
 
@@ -1472,5 +1783,282 @@ impl Store for PgStore {
         .bind(sqlx::types::Json(&payload_json))
         .execute(&self.pool)
         .await;
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+pub fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let digest = hasher.finalize();
+    hex_encode(&digest)
+}
+
+fn role_from_row(value: &str) -> Result<WorkspaceRole, ErrorEnvelope> {
+    use std::str::FromStr;
+    WorkspaceRole::from_str(value).map_err(|_| {
+        ErrorEnvelope::new(
+            ErrorCode::ObInternal,
+            "invalid role stored in database",
+            Some(serde_json::json!({"role": value})),
+        )
+    })
+}
+
+fn lifecycle_from_row(value: &str) -> Result<LifecycleState, ErrorEnvelope> {
+    use std::str::FromStr;
+    LifecycleState::from_str(value).map_err(|_| {
+        ErrorEnvelope::new(
+            ErrorCode::ObInternal,
+            "invalid lifecycle state stored in database",
+            Some(serde_json::json!({"lifecycle_state": value})),
+        )
+    })
+}
+
+#[async_trait]
+impl AuthStore for PgStore {
+    async fn auth_from_token(&self, token: &str) -> Result<AuthContext, ErrorEnvelope> {
+        if token.trim().is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObUnauthenticated,
+                "missing auth token",
+                None,
+            ));
+        }
+
+        let token_hash = hash_token(token);
+
+        #[derive(sqlx::FromRow)]
+        struct TokenRow {
+            identity_id: String,
+            workspace_id: String,
+            role: String,
+        }
+
+        let row: Option<TokenRow> = sqlx::query_as(
+            r#"SELECT identity_id, workspace_id, role
+               FROM ob_tokens
+               WHERE token_hash = $1
+                 AND revoked_at IS NULL
+               LIMIT 1"#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("auth lookup failed: {e}"),
+                None,
+            )
+        })?;
+
+        let Some(row) = row else {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObUnauthenticated,
+                "invalid auth token",
+                None,
+            ));
+        };
+
+        let role = role_from_row(&row.role)?;
+
+        Ok(AuthContext {
+            identity_id: row.identity_id,
+            workspace_id: row.workspace_id,
+            role,
+        })
+    }
+
+    async fn create_token(
+        &self,
+        req: TokenCreateRequest,
+    ) -> Result<TokenCreateResponse, ErrorEnvelope> {
+        let workspace_id = req.workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "workspace_id is required",
+                None,
+            ));
+        }
+
+        let exists: Option<String> =
+            sqlx::query_scalar(r#"SELECT id FROM ob_workspaces WHERE id = $1 LIMIT 1"#)
+                .bind(&workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("workspace lookup failed: {e}"),
+                        None,
+                    )
+                })?;
+
+        if exists.is_none() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "workspace not found",
+                Some(serde_json::json!({"workspace_id": workspace_id})),
+            ));
+        }
+
+        let identity_id = Uuid::new_v4().to_string();
+        let display_name = req
+            .display_name
+            .clone()
+            .or_else(|| req.label.clone())
+            .unwrap_or_else(|| "api-token".to_string());
+
+        sqlx::query(
+            r#"INSERT INTO ob_identities (id, display_name)
+               VALUES ($1, $2)"#,
+        )
+        .bind(&identity_id)
+        .bind(&display_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("identity insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let token = format!("ob_{}", Uuid::new_v4());
+        let token_hash = hash_token(&token);
+
+        #[derive(sqlx::FromRow)]
+        struct TokenOut {
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let created: TokenOut = sqlx::query_as(
+            r#"INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING created_at"#,
+        )
+        .bind(&token_hash)
+        .bind(&identity_id)
+        .bind(&workspace_id)
+        .bind(req.role.as_str())
+        .bind(req.label)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("token insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        Ok(TokenCreateResponse {
+            token,
+            workspace_id,
+            role: req.role,
+            identity_id,
+            created_at: created.created_at.to_rfc3339(),
+        })
+    }
+
+    async fn bootstrap_default_workspace(&self) -> Result<Option<BootstrapToken>, ErrorEnvelope> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap transaction failed: {e}"),
+                None,
+            )
+        })?;
+
+        let has_tokens: Option<i64> = sqlx::query_scalar("SELECT 1 FROM ob_tokens LIMIT 1")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("bootstrap check failed: {e}"),
+                    None,
+                )
+            })?;
+
+        if has_tokens.is_some() {
+            tx.commit().await.ok();
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"INSERT INTO ob_workspaces (id, name)
+               VALUES ($1, $2)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(DEFAULT_WORKSPACE_ID)
+        .bind(DEFAULT_WORKSPACE_NAME)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap workspace insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let identity_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO ob_identities (id, display_name)
+               VALUES ($1, $2)"#,
+        )
+        .bind(&identity_id)
+        .bind("bootstrap-owner")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap identity insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let token = format!("ob_{}", Uuid::new_v4());
+        let token_hash = hash_token(&token);
+
+        sqlx::query(
+            r#"INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(&token_hash)
+        .bind(&identity_id)
+        .bind(DEFAULT_WORKSPACE_ID)
+        .bind(WorkspaceRole::Owner.as_str())
+        .bind("bootstrap-owner")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap token insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        tx.commit().await.ok();
+
+        Ok(Some(BootstrapToken {
+            token,
+            workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+            role: WorkspaceRole::Owner,
+        }))
     }
 }
