@@ -102,6 +102,41 @@ Response envelopes and error codes are identical across both interfaces.
 
 ---
 
+## SDK Quickstart (TS + Python)
+
+SDKs live in:
+- `sdk/typescript/openbrain-sdk`
+- `sdk/python/openbrain_sdk`
+
+Start the local server (HTTP examples):
+```bash
+export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
+export OPENBRAIN_EMBED_PROVIDER="fake"
+openbrain serve
+```
+
+Run TypeScript examples:
+```bash
+cd sdk/typescript/openbrain-sdk
+npm install
+npx tsx examples/http_e2e.ts
+npx tsx examples/mcp_e2e.ts
+```
+
+Run Python examples:
+```bash
+cd sdk/python/openbrain_sdk
+py -3 -m pip install -e .
+py -3 examples/http_e2e.py
+py -3 examples/mcp_e2e.py
+```
+
+Notes:
+- Examples run on localhost and do not require live API keys by default.
+- `openbrain.memory.pack` requires `ANTHROPIC_API_KEY` set for the OpenBrain process.
+
+---
+
 ## Embedding provider selection
 
 OpenBrain uses a pluggable `EmbeddingProvider`.
