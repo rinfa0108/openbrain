@@ -70,8 +70,8 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained upstream; upgrade path is out of scope for IT9C" },
-    { id = "RUSTSEC-2024-0363", reason = "sqlx upgrade required to remediate; planned follow-up beyond IT9C scope" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained upstream; upgrade path requires broader dependency changes. Tracking: TODO(it9c.1-paste). Expiry: 2026-06-30." },
+    { id = "RUSTSEC-2024-0363", reason = "sqlx upgrade needed to remediate; requires coordinated update across workspace. Tracking: TODO(it9c.1-sqlx). Expiry: 2026-06-30." },
 ]
 # Use git CLI for advisory DB fetch (more reliable in some environments).
 git-fetch-with-cli = true
@@ -94,9 +94,7 @@ allow = [
     "BSD-3-Clause",
     "BSD-2-Clause",
     "ISC",
-    "MPL-2.0",
     "Zlib",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
 ]
@@ -149,7 +147,7 @@ registries = [
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
 # Lint level for when multiple versions of the same crate are detected
-multiple-versions = "warn"
+multiple-versions = "deny"
 # Lint level for when a crate version requirement is `*`
 wildcards = "allow"
 # The graph highlighting used when creating dotgraphs for crates
@@ -209,8 +207,22 @@ deny = [
 
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = [
-    #"ansi_term@0.11.0",
-    #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason why it can't be updated/removed" },
+    { crate = "base64", reason = "duplicate via sqlx 0.7.x vs reqwest stack; unify requires larger dependency bump" },
+    { crate = "core-foundation", reason = "duplicate from macOS TLS stack; harmless and driven by transitive deps" },
+    { crate = "getrandom", reason = "duplicate due to sqlx 0.7.x + uuid/tempfile; align requires wider updates" },
+    { crate = "hashbrown", reason = "duplicate via sqlx 0.7.x vs indexmap; avoid churn in IT9C.1 scope" },
+    { crate = "heck", reason = "duplicate via sqlx macros vs clap derive; avoid macro stack churn" },
+    { crate = "syn", reason = "duplicate via proc-macro ecosystem; aligning requires broad upgrades" },
+    { crate = "windows_x86_64_gnu", reason = "duplicate windows targets from transitive deps; acceptable for now" },
+    { crate = "windows_x86_64_gnullvm", reason = "duplicate windows targets from transitive deps; acceptable for now" },
+    { crate = "windows_x86_64_msvc", reason = "duplicate windows targets from transitive deps; acceptable for now" },
+    { crate = "windows-sys", reason = "duplicate windows-sys versions pulled by toolchain deps; avoid churn in IT9C.1" },
+    { crate = "windows-targets", reason = "duplicate windows-targets versions pulled transitively; avoid churn in IT9C.1" },
+    { crate = "windows_aarch64_gnullvm", reason = "duplicate windows target crates pulled transitively; acceptable for now" },
+    { crate = "windows_aarch64_msvc", reason = "duplicate windows target crates pulled transitively; acceptable for now" },
+    { crate = "windows_i686_gnu", reason = "duplicate windows target crates pulled transitively; acceptable for now" },
+    { crate = "windows_i686_gnullvm", reason = "duplicate windows target crates pulled transitively; acceptable for now" },
+    { crate = "windows_i686_msvc", reason = "duplicate windows target crates pulled transitively; acceptable for now" },
 ]
 # Similarly to `skip` allows you to skip certain crates during duplicate
 # detection. Unlike skip, it also includes the entire tree of transitive
