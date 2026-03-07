@@ -54,6 +54,10 @@ fn obj(
         lifecycle_state: None,
         expires_at: None,
         memory_key: None,
+        conflict_status: None,
+        resolved_by_object_id: None,
+        resolved_at: None,
+        resolution_note: None,
     }
 }
 
@@ -78,6 +82,10 @@ fn obj_with_lifecycle(
         lifecycle_state: Some(lifecycle_state),
         expires_at: None,
         memory_key: memory_key.map(|s| s.to_string()),
+        conflict_status: None,
+        resolved_by_object_id: None,
+        resolved_at: None,
+        resolution_note: None,
     }
 }
 
@@ -165,6 +173,7 @@ async fn semantic_search_orders_by_score_and_is_scope_isolated() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -227,6 +236,7 @@ async fn semantic_search_applies_filters() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -300,6 +310,7 @@ async fn semantic_search_top_k_is_capped_to_50() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -332,6 +343,7 @@ async fn semantic_search_rejects_invalid_filter() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -415,6 +427,7 @@ async fn semantic_search_respects_embedding_provider_selection() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -441,6 +454,7 @@ async fn semantic_search_respects_embedding_provider_selection() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -533,6 +547,7 @@ async fn semantic_search_respects_embedding_model_selection() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -559,6 +574,7 @@ async fn semantic_search_respects_embedding_model_selection() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -604,6 +620,7 @@ async fn semantic_search_dims_mismatch_fails() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -637,6 +654,7 @@ async fn semantic_search_large_query_rejected() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -710,6 +728,7 @@ async fn semantic_search_surfaces_conflicts() {
             status: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;

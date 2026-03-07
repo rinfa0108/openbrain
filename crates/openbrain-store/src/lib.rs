@@ -1,7 +1,7 @@
 mod pg;
 
 use async_trait::async_trait;
-use openbrain_core::{Envelope, LifecycleState, MemoryObject, MemoryObjectStored};
+use openbrain_core::{ConflictStatus, Envelope, LifecycleState, MemoryObject, MemoryObjectStored};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,6 +40,8 @@ pub struct GetObjectsRequest {
     pub include_expired: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_conflicts: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +78,8 @@ pub struct SearchStructuredRequest {
     pub include_expired: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_conflicts: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,10 +92,16 @@ pub struct SearchItem {
     pub version: i64,
     #[serde(default)]
     pub conflict: bool,
+    #[serde(default)]
+    pub conflict_status: ConflictStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflicting_object_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +135,8 @@ pub struct SearchSemanticRequest {
     pub include_expired: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_conflicts: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,10 +149,16 @@ pub struct SearchMatch {
     pub snippet: Option<String>,
     #[serde(default)]
     pub conflict: bool,
+    #[serde(default)]
+    pub conflict_status: ConflictStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflicting_object_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -151,6 +151,8 @@ struct ReadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_expired: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_conflicts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now: Option<String>,
 }
 
@@ -195,6 +197,7 @@ where
             refs: req.refs,
             include_states: req.include_states,
             include_expired: req.include_expired,
+            include_conflicts: req.include_conflicts,
             now: req.now,
         })
         .await;

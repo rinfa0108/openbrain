@@ -132,6 +132,8 @@ struct ReadArgs {
     #[serde(default)]
     include_expired: Option<bool>,
     #[serde(default)]
+    include_conflicts: Option<bool>,
+    #[serde(default)]
     now: Option<String>,
 }
 
@@ -337,6 +339,7 @@ where
                     refs: req.refs,
                     include_states: req.include_states,
                     include_expired: req.include_expired,
+                    include_conflicts: req.include_conflicts,
                     now: req.now,
                 })
                 .await;
