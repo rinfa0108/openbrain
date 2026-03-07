@@ -1,0 +1,7 @@
+title = "OpenBrain gitleaks config"
+
+[allowlist]
+paths = [
+  '''target/.*''',
+  '''sdk/.*/node_modules/.*''',
+]

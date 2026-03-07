@@ -13,6 +13,25 @@ From the repo root:
 - Lints: `cargo clippy --all-targets --all-features -- -D warnings`
 - Tests: `cargo test --all --all-features`
 
+## Quality gates (security + code quality)
+
+Run the full local gate script from the repo root:
+
+- PowerShell: `scripts/ci/quality-gates.ps1`
+- Bash: `scripts/ci/quality-gates.sh`
+
+Tooling installs:
+
+- cargo-deny: `cargo install cargo-deny`
+- gitleaks (choco): `choco install gitleaks`
+- gitleaks (brew): `brew install gitleaks`
+- gitleaks (scoop): `scoop install gitleaks`
+
+Allowlists and policy live in:
+
+- Dependency policy: `deny.toml`
+- Secret scan config: `.gitleaks.toml`
+
 ## Migrations
 
 Iteration 0 provides SQL migrations.
