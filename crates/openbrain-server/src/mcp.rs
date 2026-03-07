@@ -2,12 +2,14 @@ use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope, SPEC_VERSION};
 use openbrain_llm::AnthropicClient;
 use openbrain_server::service;
 use openbrain_store::{
-    EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
-    SearchStructuredRequest, Store,
+    AuthContext, AuthStore, EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest,
+    SearchSemanticRequest, SearchStructuredRequest, Store, TokenCreateRequest, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use openbrain_server::auth;
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -15,6 +17,11 @@ struct RpcRequest {
     method: String,
     #[serde(default)]
     params: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    auth: Option<AuthContext>,
 }
 
 #[derive(Debug)]
@@ -84,15 +91,12 @@ fn env_err<T>(code: ErrorCode, message: impl Into<String>, details: Option<Value
     Envelope::err(ErrorEnvelope::new(code, message, details))
 }
 
-fn validate_scope(scope: &str) -> Result<(), ErrorEnvelope> {
-    if scope.trim().is_empty() {
-        return Err(ErrorEnvelope::new(
-            ErrorCode::ObScopeRequired,
-            "scope is required",
-            None,
-        ));
-    }
-    Ok(())
+fn unauthenticated() -> Envelope<Value> {
+    Envelope::err(ErrorEnvelope::new(
+        ErrorCode::ObUnauthenticated,
+        "authentication required",
+        None,
+    ))
 }
 
 fn envelope_to_value<T>(env: Envelope<T>) -> Envelope<Value>
@@ -127,13 +131,14 @@ struct ReadArgs {
 
 pub async fn run_mcp_stdio<S>(store: S, llm: AnthropicClient) -> std::io::Result<()>
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
     let mut reader = BufReader::new(stdin).lines();
     let mut out = tokio::io::BufWriter::new(stdout);
+    let mut session = SessionState::default();
 
     while let Some(line) = reader.next_line().await? {
         if line.len() > MAX_LINE_BYTES {
@@ -152,7 +157,7 @@ where
 
         let req: Result<RpcRequest, _> = serde_json::from_str(&line);
         let resp = match req {
-            Ok(r) => handle_request(store.clone(), llm.clone(), r).await,
+            Ok(r) => handle_request(store.clone(), llm.clone(), &mut session, r).await,
             Err(e) => RpcResponse::error(
                 None,
                 -32700,
@@ -173,14 +178,34 @@ where
     Ok(())
 }
 
-async fn handle_request<S>(store: S, llm: AnthropicClient, req: RpcRequest) -> RpcResponse
+async fn handle_request<S>(
+    store: S,
+    llm: AnthropicClient,
+    session: &mut SessionState,
+    req: RpcRequest,
+) -> RpcResponse
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
     let id = req.id.clone();
 
     match req.method.as_str() {
         "initialize" => {
+            if let Some(params) = req.params.as_ref() {
+                if let Some(token) = params.get("auth_token").and_then(|v| v.as_str()) {
+                    match store.auth_from_token(token).await {
+                        Ok(ctx) => session.auth = Some(ctx),
+                        Err(e) => {
+                            return RpcResponse::error(
+                                id,
+                                -32001,
+                                "unauthenticated",
+                                Some(serde_json::to_value(Envelope::<Value>::err(e)).unwrap()),
+                            )
+                        }
+                    }
+                }
+            }
             let server_info = serde_json::json!({"name":"openbrain","version":SPEC_VERSION});
             let result = serde_json::json!({
                 "serverInfo": server_info,
@@ -204,7 +229,8 @@ where
                     {"name":"openbrain.embed.generate","description":"Generate embedding","inputSchema": {"type":"object"}},
                     {"name":"openbrain.search.semantic","description":"Semantic search","inputSchema": {"type":"object"}},
                     {"name":"openbrain.rerank","description":"Rerank candidates","inputSchema": {"type":"object"}},
-                    {"name":"openbrain.memory.pack","description":"Build memory pack","inputSchema": {"type":"object"}}
+                    {"name":"openbrain.memory.pack","description":"Build memory pack","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.workspace.token.create","description":"Create workspace token","inputSchema": {"type":"object"}}
                 ]
             });
             RpcResponse::result(id, tools)
@@ -226,16 +252,21 @@ where
                 }
             };
 
-            let result = dispatch_tool(store, llm, call).await;
+            let result = dispatch_tool(store, llm, session.auth.as_ref(), call).await;
             RpcResponse::result(id, serde_json::to_value(result).unwrap())
         }
         _ => RpcResponse::error(id, -32601, "method not found", None),
     }
 }
 
-async fn dispatch_tool<S>(store: S, llm: AnthropicClient, call: ToolsCallParams) -> Envelope<Value>
+async fn dispatch_tool<S>(
+    store: S,
+    llm: AnthropicClient,
+    auth_ctx: Option<&AuthContext>,
+    call: ToolsCallParams,
+) -> Envelope<Value>
 where
-    S: Store + Clone + 'static,
+    S: Store + AuthStore + Clone + 'static,
 {
     match call.name.as_str() {
         "openbrain.ping" => {
@@ -246,6 +277,13 @@ where
             }))
         }
         "openbrain.write" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Write) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: PutObjectsRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -257,9 +295,20 @@ where
                     )
                 }
             };
+            if let Err(e) = auth::ensure_object_scopes(auth_ctx, &req.objects) {
+                return Envelope::err(e);
+            }
+
             envelope_to_value(store.put_objects(req).await)
         }
         "openbrain.read" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Read) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: ReadArgs = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -272,7 +321,7 @@ where
                 }
             };
 
-            if let Err(e) = validate_scope(&req.scope) {
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
 
@@ -303,6 +352,13 @@ where
             }
         }
         "openbrain.search.structured" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Search) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: SearchStructuredRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -315,13 +371,20 @@ where
                 }
             };
 
-            if let Err(e) = validate_scope(&req.scope) {
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
 
             envelope_to_value(store.search_structured(req).await)
         }
         "openbrain.embed.generate" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Write) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: EmbedGenerateRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -334,13 +397,20 @@ where
                 }
             };
 
-            if let Err(e) = validate_scope(&req.scope) {
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
 
             envelope_to_value(store.embed_generate(req).await)
         }
         "openbrain.search.semantic" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Search) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: SearchSemanticRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -353,13 +423,20 @@ where
                 }
             };
 
-            if let Err(e) = validate_scope(&req.scope) {
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
 
             envelope_to_value(store.search_semantic(req).await)
         }
         "openbrain.rerank" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Search) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: service::RerankRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -372,9 +449,20 @@ where
                 }
             };
 
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
+                return Envelope::err(e);
+            }
+
             envelope_to_value(service::rerank(&store, &llm, req).await)
         }
         "openbrain.memory.pack" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Search) {
+                return Envelope::err(e);
+            }
+
             let args = call.arguments.unwrap_or(Value::Null);
             let req: service::MemoryPackRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
@@ -387,7 +475,53 @@ where
                 }
             };
 
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
+                return Envelope::err(e);
+            }
+
             envelope_to_value(service::build_pack(&store, &llm, req).await)
+        }
+        "openbrain.workspace.token.create" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Admin) {
+                return Envelope::err(e);
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct WorkspaceTokenCreateArgs {
+                role: WorkspaceRole,
+                #[serde(default)]
+                label: Option<String>,
+                #[serde(default)]
+                display_name: Option<String>,
+            }
+
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: WorkspaceTokenCreateArgs = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({ "error": e.to_string() })),
+                    )
+                }
+            };
+
+            match store
+                .create_token(TokenCreateRequest {
+                    workspace_id: auth_ctx.workspace_id.clone(),
+                    role: req.role,
+                    label: req.label,
+                    display_name: req.display_name,
+                })
+                .await
+            {
+                Ok(v) => envelope_to_value(Envelope::ok(v)),
+                Err(e) => Envelope::err(e),
+            }
         }
         _ => env_err(
             ErrorCode::ObInvalidRequest,
