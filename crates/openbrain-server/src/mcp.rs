@@ -127,6 +127,12 @@ struct ToolsCallParams {
 struct ReadArgs {
     scope: String,
     refs: Vec<String>,
+    #[serde(default)]
+    include_states: Option<Vec<openbrain_core::LifecycleState>>,
+    #[serde(default)]
+    include_expired: Option<bool>,
+    #[serde(default)]
+    now: Option<String>,
 }
 
 pub async fn run_mcp_stdio<S>(store: S, llm: AnthropicClient) -> std::io::Result<()>
@@ -326,7 +332,13 @@ where
             }
 
             let resp = store
-                .get_objects(GetObjectsRequest { refs: req.refs })
+                .get_objects(GetObjectsRequest {
+                    scope: req.scope.clone(),
+                    refs: req.refs,
+                    include_states: req.include_states,
+                    include_expired: req.include_expired,
+                    now: req.now,
+                })
                 .await;
 
             match resp {

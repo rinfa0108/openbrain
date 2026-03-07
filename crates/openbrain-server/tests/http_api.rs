@@ -378,3 +378,118 @@ async fn http_cross_workspace_denied() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn http_lifecycle_filters_are_enforced() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+
+    let pool = setup_pool().await.expect("pool");
+    let (token, workspace_id) = create_workspace_token(&pool, "writer").await;
+
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+
+    let id_scratch = format!("obj-{}", uuid::Uuid::new_v4());
+    let id_accepted = format!("obj-{}", uuid::Uuid::new_v4());
+
+    let write_body = json!({
+        "objects": [
+            {
+                "type": "claim",
+                "id": id_scratch,
+                "scope": workspace_id,
+                "status": "draft",
+                "spec_version": "0.1",
+                "tags": [],
+                "data": {"subject":"a","predicate":"b","object":"c","polarity":"pos"},
+                "provenance": {"actor":"tester"},
+                "lifecycle_state": "scratch"
+            },
+            {
+                "type": "claim",
+                "id": id_accepted,
+                "scope": workspace_id,
+                "status": "draft",
+                "spec_version": "0.1",
+                "tags": [],
+                "data": {"subject":"x","predicate":"y","object":"z","polarity":"pos"},
+                "provenance": {"actor":"tester"},
+                "lifecycle_state": "accepted"
+            }
+        ]
+    });
+
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&token)
+        .json(&write_body)
+        .send()
+        .await
+        .expect("write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("write json");
+    assert_eq!(write.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let read_scratch = client
+        .post(format!("{}/v1/read", base))
+        .bearer_auth(&token)
+        .json(&json!({"scope": workspace_id, "refs": [id_scratch]}))
+        .send()
+        .await
+        .expect("read scratch")
+        .json::<serde_json::Value>()
+        .await
+        .expect("read scratch json");
+    assert_eq!(
+        read_scratch
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_NOT_FOUND")
+    );
+
+    let read_override = client
+        .post(format!("{}/v1/read", base))
+        .bearer_auth(&token)
+        .json(&json!({
+            "scope": workspace_id,
+            "refs": [id_scratch],
+            "include_states": ["scratch"]
+        }))
+        .send()
+        .await
+        .expect("read override")
+        .json::<serde_json::Value>()
+        .await
+        .expect("read override json");
+    assert_eq!(
+        read_override.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let structured = client
+        .post(format!("{}/v1/search/structured", base))
+        .bearer_auth(&token)
+        .json(&json!({
+            "scope": workspace_id,
+            "where_expr": "type == \"claim\"",
+            "limit": 50,
+            "offset": 0
+        }))
+        .send()
+        .await
+        .expect("structured")
+        .json::<serde_json::Value>()
+        .await
+        .expect("structured json");
+    let results = structured
+        .get("results")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert_eq!(results.len(), 1);
+
+    server.shutdown().await;
+}
