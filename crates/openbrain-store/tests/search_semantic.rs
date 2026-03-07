@@ -409,6 +409,118 @@ async fn semantic_search_respects_embedding_provider_selection() {
     }
 }
 
+#[tokio::test]
+async fn semantic_search_respects_embedding_model_selection() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store = PgStore::from_pool_with_embedder(pool, Arc::new(FakeEmbeddingProvider));
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let model_a_id = format!("obj-{}", Uuid::new_v4());
+    let model_b_id = format!("obj-{}", Uuid::new_v4());
+
+    let model_a_data =
+        serde_json::json!({"title":"Model A","outcome":"yes","rationale":"embedding model one"});
+    let model_b_data =
+        serde_json::json!({"title":"Model B","outcome":"no","rationale":"embedding model two"});
+
+    let _ = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![
+                obj(
+                    &model_a_id,
+                    &scope,
+                    "decision",
+                    "draft",
+                    model_a_data.clone(),
+                ),
+                obj(
+                    &model_b_id,
+                    &scope,
+                    "decision",
+                    "draft",
+                    model_b_data.clone(),
+                ),
+            ],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let _ = store
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Ref {
+                r#ref: model_a_id.clone(),
+            },
+            model: "fake-v1".to_string(),
+            dims: None,
+        })
+        .await;
+
+    let _ = store
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Ref {
+                r#ref: model_b_id.clone(),
+            },
+            model: "fake-v2".to_string(),
+            dims: None,
+        })
+        .await;
+
+    let query_a = normalize_object_text("model a", &model_a_data).unwrap();
+    let query_b = normalize_object_text("model b", &model_b_data).unwrap();
+
+    let res_a = store
+        .search_semantic(SearchSemanticRequest {
+            scope: scope.clone(),
+            query: query_a,
+            top_k: Some(5),
+            model: None,
+            embedding_provider: None,
+            embedding_model: Some("fake-v1".to_string()),
+            embedding_kind: None,
+            filters: None,
+            types: None,
+            status: None,
+        })
+        .await;
+
+    match res_a {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.matches.is_empty());
+            assert_eq!(data.matches[0].r#ref, model_a_id);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    }
+
+    let res_b = store
+        .search_semantic(SearchSemanticRequest {
+            scope: scope.clone(),
+            query: query_b,
+            top_k: Some(5),
+            model: None,
+            embedding_provider: None,
+            embedding_model: Some("fake-v2".to_string()),
+            embedding_kind: None,
+            filters: None,
+            types: None,
+            status: None,
+        })
+        .await;
+
+    match res_b {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.matches.is_empty());
+            assert_eq!(data.matches[0].r#ref, model_b_id);
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    }
+}
+
 #[derive(Debug)]
 struct BadDimsProvider;
 
