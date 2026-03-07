@@ -1,7 +1,7 @@
 use openbrain_embed::NoopEmbeddingProvider;
 use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, AppState};
-use openbrain_store::PgStore;
+use openbrain_store::{hash_token, PgStore};
 use serde_json::json;
 use sqlx::PgPool;
 use std::path::PathBuf;
@@ -92,11 +92,49 @@ impl TestServer {
     }
 }
 
+async fn create_workspace_token(pool: &PgPool, role: &str) -> (String, String) {
+    let workspace_id = format!("ws-{}", uuid::Uuid::new_v4());
+    let token = format!("ob_test_{}", uuid::Uuid::new_v4());
+    let token_hash = hash_token(&token);
+    let identity_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query("INSERT INTO ob_workspaces (id, name) VALUES ($1, $2)")
+        .bind(&workspace_id)
+        .bind(&workspace_id)
+        .execute(pool)
+        .await
+        .expect("insert workspace");
+
+    sqlx::query("INSERT INTO ob_identities (id, display_name) VALUES ($1, $2)")
+        .bind(&identity_id)
+        .bind("test-identity")
+        .execute(pool)
+        .await
+        .expect("insert identity");
+
+    sqlx::query(
+        "INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&token_hash)
+    .bind(&identity_id)
+    .bind(&workspace_id)
+    .bind(role)
+    .bind("test")
+    .execute(pool)
+    .await
+    .expect("insert token");
+
+    (token, workspace_id)
+}
+
 #[tokio::test]
 async fn http_ping_write_read_and_structured_search() {
     let Some(server) = TestServer::spawn().await else {
         return;
     };
+
+    let pool = setup_pool().await.expect("pool");
+    let (token, workspace_id) = create_workspace_token(&pool, "writer").await;
 
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -113,7 +151,7 @@ async fn http_ping_write_read_and_structured_search() {
     assert_eq!(ping.get("ok").and_then(|v| v.as_bool()), Some(true));
 
     // write
-    let scope = format!("test-scope-{}", uuid::Uuid::new_v4());
+    let scope = workspace_id;
     let id1 = format!("obj-{}", uuid::Uuid::new_v4());
     let id2 = format!("obj-{}", uuid::Uuid::new_v4());
 
@@ -144,6 +182,7 @@ async fn http_ping_write_read_and_structured_search() {
 
     let write = client
         .post(format!("{}/v1/write", base))
+        .bearer_auth(&token)
         .json(&write_body)
         .send()
         .await
@@ -156,6 +195,7 @@ async fn http_ping_write_read_and_structured_search() {
     // read (scoped)
     let read = client
         .post(format!("{}/v1/read", base))
+        .bearer_auth(&token)
         .json(&json!({"scope": write_body["objects"][0]["scope"].clone(), "refs": [write_body["objects"][0]["id"].clone()]}))
         .send()
         .await
@@ -168,6 +208,7 @@ async fn http_ping_write_read_and_structured_search() {
     // structured search
     let structured = client
         .post(format!("{}/v1/search/structured", base))
+        .bearer_auth(&token)
         .json(&json!({
             "scope": write_body["objects"][0]["scope"].clone(),
             "where_expr": "type == \"claim\" AND status == \"draft\"",
@@ -187,6 +228,153 @@ async fn http_ping_write_read_and_structured_search() {
         .and_then(|v| v.as_array())
         .unwrap();
     assert_eq!(results.len(), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_requires_auth() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .json(&json!({"objects": []}))
+        .send()
+        .await
+        .expect("write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("write json");
+
+    assert_eq!(
+        write
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_UNAUTHENTICATED")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_reader_cannot_write() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+
+    let pool = setup_pool().await.expect("pool");
+    let (token, workspace_id) = create_workspace_token(&pool, "reader").await;
+
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+
+    let write_body = json!({
+        "objects": [
+            {
+                "type": "claim",
+                "id": format!("obj-{}", uuid::Uuid::new_v4()),
+                "scope": workspace_id,
+                "status": "draft",
+                "spec_version": "0.1",
+                "tags": [],
+                "data": {"subject":"a","predicate":"b","object":"c","polarity":"pos"},
+                "provenance": {"actor":"tester"}
+            }
+        ]
+    });
+
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&token)
+        .json(&write_body)
+        .send()
+        .await
+        .expect("write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("write json");
+
+    assert_eq!(
+        write
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_FORBIDDEN")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_cross_workspace_denied() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+
+    let pool = setup_pool().await.expect("pool");
+    let (token, workspace_id) = create_workspace_token(&pool, "writer").await;
+    let other_workspace = format!("ws-{}", uuid::Uuid::new_v4());
+
+    sqlx::query("INSERT INTO ob_workspaces (id, name) VALUES ($1, $2)")
+        .bind(&other_workspace)
+        .bind(&other_workspace)
+        .execute(&pool)
+        .await
+        .expect("insert other workspace");
+
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+
+    let write_body = json!({
+        "objects": [
+            {
+                "type": "claim",
+                "id": format!("obj-{}", uuid::Uuid::new_v4()),
+                "scope": workspace_id,
+                "status": "draft",
+                "spec_version": "0.1",
+                "tags": [],
+                "data": {"subject":"a","predicate":"b","object":"c","polarity":"pos"},
+                "provenance": {"actor":"tester"}
+            }
+        ]
+    });
+
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&token)
+        .json(&write_body)
+        .send()
+        .await
+        .expect("write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("write json");
+    assert_eq!(write.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let read = client
+        .post(format!("{}/v1/read", base))
+        .bearer_auth(&token)
+        .json(&json!({"scope": other_workspace, "refs": [write_body["objects"][0]["id"].clone()]}))
+        .send()
+        .await
+        .expect("read")
+        .json::<serde_json::Value>()
+        .await
+        .expect("read json");
+
+    assert_eq!(
+        read.get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_FORBIDDEN")
+    );
 
     server.shutdown().await;
 }

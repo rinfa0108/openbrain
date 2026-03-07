@@ -8,7 +8,7 @@ use openbrain_embed::{
 };
 use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, AppState};
-use openbrain_store::PgStore;
+use openbrain_store::{AuthStore, PgStore};
 use std::{net::SocketAddr, sync::Arc};
 use tracing::{info, warn};
 
@@ -87,6 +87,21 @@ async fn connect_store(database_url: Option<String>, embed_provider: String) -> 
     }
 }
 
+async fn bootstrap_default_workspace(store: &PgStore) {
+    match store.bootstrap_default_workspace().await {
+        Ok(Some(token)) => {
+            println!(
+                "bootstrap owner token (workspace={}): {}",
+                token.workspace_id, token.token
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("bootstrap failed: {} ({})", e.message, e.code);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing();
@@ -101,6 +116,7 @@ async fn main() {
             embed_provider,
         } => {
             let store = connect_store(database_url, embed_provider).await;
+            bootstrap_default_workspace(&store).await;
 
             let addr: SocketAddr = format!("{}:{}", bind, port).parse().unwrap_or_else(|_| {
                 eprintln!("invalid bind/port: {bind}:{port}");
@@ -136,6 +152,7 @@ async fn main() {
             embed_provider,
         } => {
             let store = connect_store(database_url, embed_provider).await;
+            bootstrap_default_workspace(&store).await;
 
             info!(
                 "OpenBrain MCP stdio (spec v{})",

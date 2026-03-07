@@ -6,15 +6,17 @@ use openbrain_core::{
 };
 use openbrain_embed::{EmbedError, EmbeddingProvider, NoopEmbeddingProvider};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
-    GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
-    SearchMatch, SearchSemanticRequest, SearchSemanticResponse, SearchStructuredRequest,
-    SearchStructuredResponse, Store,
+    AuthContext, AuthStore, BootstrapToken, EmbedGenerateRequest, EmbedGenerateResponse,
+    EmbedTarget, GetObjectsRequest, GetObjectsResponse, OrderBySpec, PutObjectsRequest,
+    PutObjectsResponse, PutResult, SearchItem, SearchMatch, SearchSemanticRequest,
+    SearchSemanticResponse, SearchStructuredRequest, SearchStructuredResponse, Store,
+    TokenCreateRequest, TokenCreateResponse, WorkspaceRole,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -25,6 +27,8 @@ const MAX_EMBED_TEXT_LEN: usize = 32 * 1024;
 const DEFAULT_EMBED_PROVIDER: &str = "noop";
 const DEFAULT_EMBED_KIND: &str = "semantic";
 const DEFAULT_EMBED_MODEL: &str = "default";
+const DEFAULT_WORKSPACE_ID: &str = "default";
+const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 
 fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
     let mut out = String::with_capacity(embedding.len() * 12 + 2);
@@ -1472,5 +1476,271 @@ impl Store for PgStore {
         .bind(sqlx::types::Json(&payload_json))
         .execute(&self.pool)
         .await;
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+pub fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let digest = hasher.finalize();
+    hex_encode(&digest)
+}
+
+fn role_from_row(value: &str) -> Result<WorkspaceRole, ErrorEnvelope> {
+    use std::str::FromStr;
+    WorkspaceRole::from_str(value).map_err(|_| {
+        ErrorEnvelope::new(
+            ErrorCode::ObInternal,
+            "invalid role stored in database",
+            Some(serde_json::json!({"role": value})),
+        )
+    })
+}
+
+#[async_trait]
+impl AuthStore for PgStore {
+    async fn auth_from_token(&self, token: &str) -> Result<AuthContext, ErrorEnvelope> {
+        if token.trim().is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObUnauthenticated,
+                "missing auth token",
+                None,
+            ));
+        }
+
+        let token_hash = hash_token(token);
+
+        #[derive(sqlx::FromRow)]
+        struct TokenRow {
+            identity_id: String,
+            workspace_id: String,
+            role: String,
+        }
+
+        let row: Option<TokenRow> = sqlx::query_as(
+            r#"SELECT identity_id, workspace_id, role
+               FROM ob_tokens
+               WHERE token_hash = $1
+                 AND revoked_at IS NULL
+               LIMIT 1"#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("auth lookup failed: {e}"),
+                None,
+            )
+        })?;
+
+        let Some(row) = row else {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObUnauthenticated,
+                "invalid auth token",
+                None,
+            ));
+        };
+
+        let role = role_from_row(&row.role)?;
+
+        Ok(AuthContext {
+            identity_id: row.identity_id,
+            workspace_id: row.workspace_id,
+            role,
+        })
+    }
+
+    async fn create_token(
+        &self,
+        req: TokenCreateRequest,
+    ) -> Result<TokenCreateResponse, ErrorEnvelope> {
+        let workspace_id = req.workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "workspace_id is required",
+                None,
+            ));
+        }
+
+        let exists: Option<String> =
+            sqlx::query_scalar(r#"SELECT id FROM ob_workspaces WHERE id = $1 LIMIT 1"#)
+                .bind(&workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("workspace lookup failed: {e}"),
+                        None,
+                    )
+                })?;
+
+        if exists.is_none() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "workspace not found",
+                Some(serde_json::json!({"workspace_id": workspace_id})),
+            ));
+        }
+
+        let identity_id = Uuid::new_v4().to_string();
+        let display_name = req
+            .display_name
+            .clone()
+            .or_else(|| req.label.clone())
+            .unwrap_or_else(|| "api-token".to_string());
+
+        sqlx::query(
+            r#"INSERT INTO ob_identities (id, display_name)
+               VALUES ($1, $2)"#,
+        )
+        .bind(&identity_id)
+        .bind(&display_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("identity insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let token = format!("ob_{}", Uuid::new_v4());
+        let token_hash = hash_token(&token);
+
+        #[derive(sqlx::FromRow)]
+        struct TokenOut {
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let created: TokenOut = sqlx::query_as(
+            r#"INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING created_at"#,
+        )
+        .bind(&token_hash)
+        .bind(&identity_id)
+        .bind(&workspace_id)
+        .bind(req.role.as_str())
+        .bind(req.label)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("token insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        Ok(TokenCreateResponse {
+            token,
+            workspace_id,
+            role: req.role,
+            identity_id,
+            created_at: created.created_at.to_rfc3339(),
+        })
+    }
+
+    async fn bootstrap_default_workspace(&self) -> Result<Option<BootstrapToken>, ErrorEnvelope> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap transaction failed: {e}"),
+                None,
+            )
+        })?;
+
+        let has_tokens: Option<i64> = sqlx::query_scalar("SELECT 1 FROM ob_tokens LIMIT 1")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("bootstrap check failed: {e}"),
+                    None,
+                )
+            })?;
+
+        if has_tokens.is_some() {
+            tx.commit().await.ok();
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"INSERT INTO ob_workspaces (id, name)
+               VALUES ($1, $2)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(DEFAULT_WORKSPACE_ID)
+        .bind(DEFAULT_WORKSPACE_NAME)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap workspace insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let identity_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO ob_identities (id, display_name)
+               VALUES ($1, $2)"#,
+        )
+        .bind(&identity_id)
+        .bind("bootstrap-owner")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap identity insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        let token = format!("ob_{}", Uuid::new_v4());
+        let token_hash = hash_token(&token);
+
+        sqlx::query(
+            r#"INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(&token_hash)
+        .bind(&identity_id)
+        .bind(DEFAULT_WORKSPACE_ID)
+        .bind(WorkspaceRole::Owner.as_str())
+        .bind("bootstrap-owner")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap token insert failed: {e}"),
+                None,
+            )
+        })?;
+
+        tx.commit().await.ok();
+
+        Ok(Some(BootstrapToken {
+            token,
+            workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+            role: WorkspaceRole::Owner,
+        }))
     }
 }
