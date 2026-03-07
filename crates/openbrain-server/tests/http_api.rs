@@ -493,3 +493,188 @@ async fn http_lifecycle_filters_are_enforced() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn http_policy_denies_reader_decision_and_writer_promotion() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+
+    let pool = setup_pool().await.expect("pool");
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner").await;
+    let (reader_token, _) = create_workspace_token(&pool, "reader").await;
+    let (writer_token, _) = create_workspace_token(&pool, "writer").await;
+
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+
+    let policy_reader_deny = json!({
+        "objects": [{
+            "type": "policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status": "canonical",
+            "spec_version": "0.1",
+            "tags": [],
+            "data": {
+                "id": "deny-reader-decision",
+                "effect": "deny",
+                "operations": ["read", "search_structured", "search_semantic"],
+                "roles": ["reader"],
+                "object_kinds": ["decision"],
+                "reason": "OB_POLICY_DENY_DECISION_READ"
+            },
+            "provenance": {"actor":"owner"}
+        }]
+    });
+    let policy_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&policy_reader_deny)
+        .send()
+        .await
+        .expect("policy write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy json");
+    assert_eq!(policy_write.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let decision_id = format!("decision-{}", uuid::Uuid::new_v4());
+    let write_decision = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects": [{
+                "type":"decision",
+                "id": decision_id,
+                "scope": workspace_id,
+                "status":"draft",
+                "spec_version":"0.1",
+                "tags": [],
+                "data":{"k":"v"},
+                "provenance":{"actor":"writer"}
+            }]
+        }))
+        .send()
+        .await
+        .expect("write decision")
+        .json::<serde_json::Value>()
+        .await
+        .expect("write decision json");
+    assert_eq!(
+        write_decision.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let denied_read = client
+        .post(format!("{}/v1/read", base))
+        .bearer_auth(&reader_token)
+        .json(&json!({"scope": workspace_id, "refs": [decision_id]}))
+        .send()
+        .await
+        .expect("read decision")
+        .json::<serde_json::Value>()
+        .await
+        .expect("read decision json");
+    assert_eq!(
+        denied_read
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_FORBIDDEN")
+    );
+
+    let policy_promote_deny = json!({
+        "objects": [{
+            "type": "policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status": "canonical",
+            "spec_version": "0.1",
+            "tags": [],
+            "data": {
+                "id": "deny-writer-promote",
+                "effect": "deny",
+                "operations": ["write"],
+                "roles": ["writer"],
+                "lifecycle_transitions": ["candidate->accepted"],
+                "reason": "OB_POLICY_DENY_PROMOTE_ACCEPTED"
+            },
+            "provenance": {"actor":"owner"}
+        }]
+    });
+    let policy_promote = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&policy_promote_deny)
+        .send()
+        .await
+        .expect("policy promote write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy promote json");
+    assert_eq!(
+        policy_promote.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let claim_id = format!("claim-{}", uuid::Uuid::new_v4());
+    let writer_candidate = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects": [{
+                "type":"claim",
+                "id": claim_id,
+                "scope": workspace_id,
+                "status":"candidate",
+                "spec_version":"0.1",
+                "tags": [],
+                "data":{"k":"v1"},
+                "provenance":{"actor":"writer"},
+                "lifecycle_state":"candidate"
+            }]
+        }))
+        .send()
+        .await
+        .expect("writer candidate")
+        .json::<serde_json::Value>()
+        .await
+        .expect("writer candidate json");
+    assert_eq!(
+        writer_candidate.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let writer_promote = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects": [{
+                "type":"claim",
+                "id": claim_id,
+                "scope": workspace_id,
+                "status":"canonical",
+                "spec_version":"0.1",
+                "tags": [],
+                "data":{"k":"v1"},
+                "provenance":{"actor":"writer"},
+                "lifecycle_state":"accepted"
+            }]
+        }))
+        .send()
+        .await
+        .expect("writer promote")
+        .json::<serde_json::Value>()
+        .await
+        .expect("writer promote json");
+    assert_eq!(
+        writer_promote
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str()),
+        Some("OB_FORBIDDEN")
+    );
+
+    server.shutdown().await;
+}
