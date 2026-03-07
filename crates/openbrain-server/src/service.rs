@@ -119,6 +119,9 @@ where
                     filters: None,
                     types: None,
                     status: None,
+                    include_states: None,
+                    include_expired: None,
+                    now: None,
                 })
                 .await;
             let refs = match search {
@@ -291,6 +294,9 @@ where
             limit: Some(max_items as u32),
             offset: Some(0),
             order_by: None,
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 
@@ -312,7 +318,15 @@ where
         return Ok(Vec::new());
     }
 
-    let res = store.get_objects(GetObjectsRequest { refs }).await;
+    let res = store
+        .get_objects(GetObjectsRequest {
+            scope: scope.to_string(),
+            refs,
+            include_states: None,
+            include_expired: None,
+            now: None,
+        })
+        .await;
     let data = match res {
         Envelope::Ok { data, .. } => data,
         Envelope::Err { error, .. } => return Err(error),

@@ -146,6 +146,12 @@ where
 struct ReadRequest {
     pub scope: String,
     pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_states: Option<Vec<openbrain_core::LifecycleState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_expired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,7 +190,13 @@ where
 
     let resp = state
         .store
-        .get_objects(GetObjectsRequest { refs: req.refs })
+        .get_objects(GetObjectsRequest {
+            scope: req.scope.clone(),
+            refs: req.refs,
+            include_states: req.include_states,
+            include_expired: req.include_expired,
+            now: req.now,
+        })
         .await;
 
     match resp {

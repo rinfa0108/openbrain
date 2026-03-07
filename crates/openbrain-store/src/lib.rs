@@ -1,7 +1,7 @@
 mod pg;
 
 use async_trait::async_trait;
-use openbrain_core::{Envelope, MemoryObject, MemoryObjectStored};
+use openbrain_core::{Envelope, LifecycleState, MemoryObject, MemoryObjectStored};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,7 +32,14 @@ pub struct PutObjectsResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetObjectsRequest {
+    pub scope: String,
     pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_states: Option<Vec<LifecycleState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_expired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +70,12 @@ pub struct SearchStructuredRequest {
     pub offset: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_by: Option<OrderBySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_states: Option<Vec<LifecycleState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_expired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +86,12 @@ pub struct SearchItem {
     pub status: String,
     pub updated_at: String,
     pub version: i64,
+    #[serde(default)]
+    pub conflict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflicting_object_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +119,12 @@ pub struct SearchSemanticRequest {
     pub types: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_states: Option<Vec<LifecycleState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_expired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +135,12 @@ pub struct SearchMatch {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    #[serde(default)]
+    pub conflict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflicting_object_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

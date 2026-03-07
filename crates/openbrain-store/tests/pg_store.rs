@@ -39,6 +39,9 @@ fn valid_object(id: &str, scope: &str, spec_version: &str) -> MemoryObject {
         tags: Some(vec!["t1".to_string()]),
         data: Some(serde_json::json!({"k":"v"})),
         provenance: Some(serde_json::json!({"actor":"tester"})),
+        lifecycle_state: None,
+        expires_at: None,
+        memory_key: None,
     }
 }
 
@@ -72,7 +75,11 @@ async fn roundtrip_write_read() {
 
     let got = store
         .get_objects(GetObjectsRequest {
+            scope: scope.clone(),
             refs: vec![id.clone()],
+            include_states: None,
+            include_expired: None,
+            now: None,
         })
         .await;
 

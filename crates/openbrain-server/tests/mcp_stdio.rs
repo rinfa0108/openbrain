@@ -285,3 +285,137 @@ fn mcp_stdio_reader_forbidden_write() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn mcp_stdio_lifecycle_filters_read() {
+    let Some(pool) = setup_pool() else {
+        return;
+    };
+    let (token, workspace_id) = create_workspace_token(&pool, "writer");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openbrain"))
+        .arg("mcp")
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("db url"),
+        )
+        .env("OPENBRAIN_EMBED_PROVIDER", "noop")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openbrain mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    let obj_id = "obj-lifecycle-1";
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params": {"protocolVersion":"0","auth_token": token}
+        })
+    )
+    .expect("write initialize");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params": {"name":"openbrain.write","arguments":{
+                "objects":[{"type":"claim","id":obj_id,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"subject":"a","predicate":"b","object":"c","polarity":"pos"},"provenance":{"actor":"tester"},"lifecycle_state":"scratch"}]
+            }}
+        })
+    )
+    .expect("write tools/call");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params": {"name":"openbrain.read","arguments":{"scope":workspace_id,"refs":[obj_id]}}
+        })
+    )
+    .expect("write read");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params": {"name":"openbrain.read","arguments":{"scope":workspace_id,"refs":[obj_id],"include_states":["scratch"]}}
+        })
+    )
+    .expect("write read override");
+
+    drop(stdin);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let mut saw_write = false;
+    let mut saw_read_denied = false;
+    let mut saw_read_override = false;
+
+    while start.elapsed() < deadline {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let Ok(line) = rx.recv_timeout(remaining) else {
+            break;
+        };
+        let v: Value = serde_json::from_str(&line).expect("stdout JSON");
+        let id = v.get("id").and_then(|id| id.as_i64());
+        if id == Some(2) {
+            let result = v.get("result").expect("result");
+            assert_eq!(result.get("ok").and_then(|b| b.as_bool()), Some(true));
+            saw_write = true;
+        }
+        if id == Some(3) {
+            let result = v.get("result").expect("result");
+            let code = result
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|s| s.as_str());
+            if code == Some("OB_NOT_FOUND") {
+                saw_read_denied = true;
+            }
+        }
+        if id == Some(4) {
+            let result = v.get("result").expect("result");
+            assert_eq!(result.get("ok").and_then(|b| b.as_bool()), Some(true));
+            saw_read_override = true;
+        }
+
+        if saw_write && saw_read_denied && saw_read_override {
+            break;
+        }
+    }
+
+    assert!(saw_write);
+    assert!(saw_read_denied);
+    assert!(saw_read_override);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -179,6 +179,20 @@ pub fn checksum_v01(normalized_text: &str) -> String {
     format!("{CHECKSUM_PREFIX}{hex}")
 }
 
+pub fn value_hash_v01(data: &Value) -> String {
+    let canonical = canonicalize_json(data);
+    let serialized = serde_json::to_string(&canonical).unwrap_or_else(|_| "null".to_string());
+    let mut h = Sha256::new();
+    h.update(b"ob.v0.1\n");
+    h.update(serialized.as_bytes());
+    let bytes = h.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("{CHECKSUM_PREFIX}{hex}")
+}
+
 pub fn validate_checksum_format(checksum: &str) -> Result<(), ErrorEnvelope> {
     if !checksum.starts_with(CHECKSUM_PREFIX) {
         return Err(ErrorEnvelope::new(
