@@ -121,6 +121,7 @@ where
                     status: None,
                     include_states: None,
                     include_expired: None,
+                    include_conflicts: None,
                     now: None,
                 })
                 .await;
@@ -296,6 +297,7 @@ where
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -324,6 +326,7 @@ where
             refs,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;

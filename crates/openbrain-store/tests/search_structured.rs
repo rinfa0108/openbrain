@@ -1,4 +1,4 @@
-use openbrain_core::{Envelope, LifecycleState, MemoryObject};
+use openbrain_core::{ConflictStatus, Envelope, LifecycleState, MemoryObject};
 use openbrain_store::{
     OrderBySpec, OrderDirection, PgStore, PutObjectsRequest, SearchStructuredRequest, Store,
 };
@@ -50,6 +50,10 @@ fn obj(
         lifecycle_state: None,
         expires_at: None,
         memory_key: None,
+        conflict_status: None,
+        resolved_by_object_id: None,
+        resolved_at: None,
+        resolution_note: None,
     }
 }
 
@@ -76,6 +80,10 @@ fn obj_with_lifecycle(
         lifecycle_state: Some(lifecycle_state),
         expires_at: expires_at.map(|s| s.to_string()),
         memory_key: memory_key.map(|s| s.to_string()),
+        conflict_status: None,
+        resolved_by_object_id: None,
+        resolved_at: None,
+        resolution_note: None,
     }
 }
 
@@ -135,6 +143,7 @@ async fn structured_search_filters_and_restricts_scope() {
             }),
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -191,6 +200,7 @@ async fn structured_search_filters_by_nested_data() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -222,6 +232,7 @@ async fn structured_search_rejects_unknown_field() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -250,6 +261,7 @@ async fn structured_search_rejects_injection_like_input() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -344,6 +356,7 @@ async fn structured_search_defaults_to_accepted_and_not_expired() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: Some(now.to_string()),
         })
         .await;
@@ -419,6 +432,7 @@ async fn structured_search_include_states_and_expired_override() {
             order_by: None,
             include_states: Some(vec![LifecycleState::Scratch, LifecycleState::Accepted]),
             include_expired: Some(true),
+            include_conflicts: None,
             now: Some(now.to_string()),
         })
         .await;
@@ -471,6 +485,7 @@ async fn structured_search_promotion_changes_visibility() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -506,6 +521,7 @@ async fn structured_search_promotion_changes_visibility() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -570,6 +586,7 @@ async fn structured_search_conflict_detection() {
             order_by: None,
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
@@ -586,6 +603,118 @@ async fn structured_search_conflict_detection() {
                     .map(|ids| !ids.is_empty())
                     .unwrap_or(false));
             }
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    }
+}
+
+#[tokio::test]
+async fn structured_search_conflict_resolution_persists_and_clears_default_conflict() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+    let store = PgStore::from_pool(pool);
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let key = "decision:db_provider";
+
+    let winner_id = format!("obj-{}", Uuid::new_v4());
+    let loser_id = format!("obj-{}", Uuid::new_v4());
+    let resolved_at = "2026-01-03T00:00:00Z";
+
+    let _ = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![
+                obj_with_lifecycle(
+                    &winner_id,
+                    &scope,
+                    "claim",
+                    "draft",
+                    LifecycleState::Accepted,
+                    None,
+                    Some(key),
+                    serde_json::json!({"value": "postgres"}),
+                ),
+                obj_with_lifecycle(
+                    &loser_id,
+                    &scope,
+                    "claim",
+                    "draft",
+                    LifecycleState::Accepted,
+                    None,
+                    Some(key),
+                    serde_json::json!({"value": "sqlite"}),
+                ),
+            ],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let mut winner = obj_with_lifecycle(
+        &winner_id,
+        &scope,
+        "claim",
+        "draft",
+        LifecycleState::Accepted,
+        None,
+        Some(key),
+        serde_json::json!({"value": "postgres"}),
+    );
+    winner.conflict_status = Some(ConflictStatus::Resolved);
+    winner.resolved_by_object_id = Some(winner_id.clone());
+    winner.resolved_at = Some(resolved_at.to_string());
+    winner.resolution_note = Some("winner selected".to_string());
+
+    let loser = obj_with_lifecycle(
+        &loser_id,
+        &scope,
+        "claim",
+        "draft",
+        LifecycleState::Deprecated,
+        None,
+        Some(key),
+        serde_json::json!({"value": "sqlite"}),
+    );
+
+    let _ = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![winner, loser],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let res = store
+        .search_structured(SearchStructuredRequest {
+            scope: scope.clone(),
+            where_expr: Some(r#"type == "claim""#.to_string()),
+            limit: Some(50),
+            offset: Some(0),
+            order_by: None,
+            include_states: None,
+            include_expired: None,
+            include_conflicts: Some(true),
+            now: None,
+        })
+        .await;
+
+    match res {
+        Envelope::Ok { data, .. } => {
+            assert_eq!(data.results.len(), 1);
+            let row = &data.results[0];
+            assert_eq!(row.r#ref, winner_id);
+            assert!(!row.conflict);
+            assert_eq!(row.conflict_status, ConflictStatus::Resolved);
+            assert_eq!(
+                row.resolved_by_object_id.as_deref(),
+                Some(winner_id.as_str())
+            );
+            assert!(row
+                .resolved_at
+                .as_deref()
+                .map(|v| v.starts_with("2026-01-03T00:00:00"))
+                .unwrap_or(false));
         }
         Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
     }

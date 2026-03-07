@@ -4,7 +4,8 @@ use openbrain_core::textnorm::{
     checksum_v01, normalize_object_text, validate_embedding_text, value_hash_v01,
 };
 use openbrain_core::{
-    Envelope, ErrorCode, ErrorEnvelope, LifecycleState, MemoryObjectStored, ValidatedMemoryObject,
+    ConflictStatus, Envelope, ErrorCode, ErrorEnvelope, LifecycleState, MemoryObjectStored,
+    ValidatedMemoryObject,
 };
 use openbrain_embed::{EmbedError, EmbeddingProvider, NoopEmbeddingProvider};
 use serde_json::Value;
@@ -268,8 +269,9 @@ impl PgStore {
                 let version: i64 = sqlx::query_scalar(
                     r#"INSERT INTO ob_objects
                        (id, scope, type, status, spec_version, tags, data, provenance, version,
-                        lifecycle_state, expires_at, memory_key, value_hash)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12)
+                        lifecycle_state, expires_at, memory_key, value_hash, conflict_status,
+                        resolved_by_object_id, resolved_at, resolution_note)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12, $13, $14, $15, $16)
                        RETURNING version"#,
                 )
                 .bind(&obj.id)
@@ -284,6 +286,13 @@ impl PgStore {
                 .bind(expires_at)
                 .bind(obj.memory_key.as_deref())
                 .bind(value_hash)
+                .bind(obj.conflict_status.as_str())
+                .bind(obj.resolved_by_object_id.as_deref())
+                .bind(Self::parse_datetime_opt(
+                    "resolved_at",
+                    obj.resolved_at.as_deref(),
+                )?)
+                .bind(obj.resolution_note.as_deref())
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|e| {
@@ -318,6 +327,10 @@ impl PgStore {
                            expires_at = $11,
                            memory_key = $12,
                            value_hash = $13,
+                           conflict_status = $14,
+                           resolved_by_object_id = $15,
+                           resolved_at = $16,
+                           resolution_note = $17,
                            updated_at = now()
                        WHERE id = $1
                        RETURNING version"#,
@@ -335,6 +348,13 @@ impl PgStore {
                 .bind(expires_at)
                 .bind(obj.memory_key.as_deref())
                 .bind(value_hash)
+                .bind(obj.conflict_status.as_str())
+                .bind(obj.resolved_by_object_id.as_deref())
+                .bind(Self::parse_datetime_opt(
+                    "resolved_at",
+                    obj.resolved_at.as_deref(),
+                )?)
+                .bind(obj.resolution_note.as_deref())
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|e| {
@@ -384,6 +404,21 @@ struct ConflictInfo {
     distinct_count: i64,
     total_count: i64,
     ids: Vec<String>,
+}
+
+fn include_conflicts_enabled(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
+}
+
+fn default_expiry_for_state(
+    state: LifecycleState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match state {
+        LifecycleState::Scratch => Some(now + chrono::Duration::days(7)),
+        LifecycleState::Candidate => Some(now + chrono::Duration::days(30)),
+        LifecycleState::Accepted | LifecycleState::Deprecated => None,
+    }
 }
 
 fn field_to_sql(field: &FieldPath) -> Result<(String, FieldType), ErrorEnvelope> {
@@ -979,6 +1014,9 @@ impl Store for PgStore {
                         return Envelope::err(e);
                     }
                 };
+            let expires_at = expires_at.or_else(|| {
+                default_expiry_for_state(validated.lifecycle_state, chrono::Utc::now())
+            });
             let value_hash = validated
                 .memory_key
                 .as_ref()
@@ -1085,6 +1123,10 @@ impl Store for PgStore {
             lifecycle_state: String,
             expires_at: Option<chrono::DateTime<chrono::Utc>>,
             memory_key: Option<String>,
+            conflict_status: String,
+            resolved_by_object_id: Option<String>,
+            resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+            resolution_note: Option<String>,
         }
 
         let rows: Vec<ObRow> = match sqlx::query_as(
@@ -1101,7 +1143,11 @@ impl Store for PgStore {
                       updated_at,
                       lifecycle_state,
                       expires_at,
-                      memory_key
+                      memory_key,
+                      conflict_status,
+                      resolved_by_object_id,
+                      resolved_at,
+                      resolution_note
                FROM ob_objects
                WHERE id = ANY($1)
                  AND scope = $2
@@ -1147,6 +1193,13 @@ impl Store for PgStore {
                     },
                     expires_at: r.expires_at.map(|dt| dt.to_rfc3339()),
                     memory_key: r.memory_key,
+                    conflict_status: match conflict_status_from_row(&r.conflict_status) {
+                        Ok(v) => v,
+                        Err(e) => return Envelope::err(e),
+                    },
+                    resolved_by_object_id: r.resolved_by_object_id,
+                    resolved_at: r.resolved_at.map(|dt| dt.to_rfc3339()),
+                    resolution_note: r.resolution_note,
                 },
             );
         }
@@ -1200,6 +1253,7 @@ impl Store for PgStore {
             now
         };
         let state_strings = Self::to_state_strings(&include_states);
+        let include_conflicts = include_conflicts_enabled(req.include_conflicts);
 
         let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as i64;
         let offset = req.offset.unwrap_or(0) as i64;
@@ -1218,7 +1272,7 @@ impl Store for PgStore {
         };
 
         let mut qb = QueryBuilder::new(
-            "SELECT id, type, status, updated_at, version, memory_key FROM ob_objects WHERE scope = ",
+            "SELECT id, type, status, updated_at, version, memory_key, conflict_status, resolved_by_object_id, resolved_at FROM ob_objects WHERE scope = ",
         );
         qb.push_bind(&req.scope);
         qb.push(" AND lifecycle_state = ANY(");
@@ -1250,6 +1304,9 @@ impl Store for PgStore {
             updated_at: chrono::DateTime<chrono::Utc>,
             version: i64,
             memory_key: Option<String>,
+            conflict_status: String,
+            resolved_by_object_id: Option<String>,
+            resolved_at: Option<chrono::DateTime<chrono::Utc>>,
         }
 
         let rows: Vec<SearchRow> = match qb.build_query_as().fetch_all(&self.pool).await {
@@ -1263,18 +1320,28 @@ impl Store for PgStore {
             }
         };
 
-        let memory_keys: Vec<String> = rows.iter().filter_map(|r| r.memory_key.clone()).collect();
-        let conflict_map = match self
-            .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => return Envelope::err(e),
+        let conflict_map = if include_conflicts {
+            let memory_keys: Vec<String> =
+                rows.iter().filter_map(|r| r.memory_key.clone()).collect();
+            match self
+                .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Envelope::err(e),
+            }
+        } else {
+            std::collections::HashMap::new()
         };
 
         let results = rows
             .into_iter()
             .map(|r| {
+                let conflict_status = match conflict_status_from_row(&r.conflict_status) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+
                 let (conflict, conflict_count, conflicting_object_ids) =
                     match r.memory_key.as_ref().and_then(|k| conflict_map.get(k)) {
                         Some(info) if info.distinct_count > 1 => {
@@ -1288,18 +1355,26 @@ impl Store for PgStore {
                         _ => (false, None, None),
                     };
 
-                SearchItem {
+                Ok(SearchItem {
                     r#ref: r.id,
                     object_type: r.r#type,
                     status: r.status,
                     updated_at: r.updated_at.to_rfc3339(),
                     version: r.version,
                     conflict,
+                    conflict_status,
                     conflict_count,
                     conflicting_object_ids,
-                }
+                    resolved_by_object_id: r.resolved_by_object_id,
+                    resolved_at: r.resolved_at.map(|dt| dt.to_rfc3339()),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ErrorEnvelope>>();
+
+        let results = match results {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
 
         Envelope::ok(SearchStructuredResponse { results })
     }
@@ -1554,6 +1629,7 @@ impl Store for PgStore {
             now
         };
         let state_strings = Self::to_state_strings(&include_states);
+        let include_conflicts = include_conflicts_enabled(req.include_conflicts);
 
         let top_k = req.top_k.unwrap_or(10).min(50) as i64;
 
@@ -1647,7 +1723,7 @@ impl Store for PgStore {
             "SELECT o.id as ref, o.type as kind, (1.0 - (e.embedding <=> (",
         );
         qb.push_bind(&vector_text);
-        qb.push(")::vector))::float4 as score, o.updated_at::text as updated_at, o.memory_key as memory_key ");
+        qb.push(")::vector))::float4 as score, o.updated_at::text as updated_at, o.memory_key as memory_key, o.conflict_status as conflict_status, o.resolved_by_object_id as resolved_by_object_id, o.resolved_at::text as resolved_at ");
         qb.push("FROM ob_embeddings e ");
         qb.push("JOIN ob_objects o ON o.id = e.object_id ");
         qb.push("WHERE e.object_id IS NOT NULL ");
@@ -1708,6 +1784,9 @@ impl Store for PgStore {
             score: f32,
             updated_at: String,
             memory_key: Option<String>,
+            conflict_status: String,
+            resolved_by_object_id: Option<String>,
+            resolved_at: Option<String>,
         }
 
         let rows: Vec<RowOut> = match qb.build_query_as().fetch_all(&self.pool).await {
@@ -1721,18 +1800,28 @@ impl Store for PgStore {
             }
         };
 
-        let memory_keys: Vec<String> = rows.iter().filter_map(|r| r.memory_key.clone()).collect();
-        let conflict_map = match self
-            .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => return Envelope::err(e),
+        let conflict_map = if include_conflicts {
+            let memory_keys: Vec<String> =
+                rows.iter().filter_map(|r| r.memory_key.clone()).collect();
+            match self
+                .load_conflicts(&req.scope, &memory_keys, &state_strings, now)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Envelope::err(e),
+            }
+        } else {
+            std::collections::HashMap::new()
         };
 
         let matches = rows
             .into_iter()
             .map(|r| {
+                let conflict_status = match conflict_status_from_row(&r.conflict_status) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+
                 let (conflict, conflict_count, conflicting_object_ids) =
                     match r.memory_key.as_ref().and_then(|k| conflict_map.get(k)) {
                         Some(info) if info.distinct_count > 1 => {
@@ -1750,18 +1839,26 @@ impl Store for PgStore {
                         _ => (false, None, None),
                     };
 
-                SearchMatch {
+                Ok(SearchMatch {
                     r#ref: r.r#ref,
                     kind: r.kind,
                     score: r.score,
                     updated_at: r.updated_at,
                     snippet: None,
                     conflict,
+                    conflict_status,
                     conflict_count,
                     conflicting_object_ids,
-                }
+                    resolved_by_object_id: r.resolved_by_object_id,
+                    resolved_at: r.resolved_at,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ErrorEnvelope>>();
+
+        let matches = match matches {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
 
         Envelope::ok(SearchSemanticResponse { matches })
     }
@@ -1819,6 +1916,17 @@ fn lifecycle_from_row(value: &str) -> Result<LifecycleState, ErrorEnvelope> {
             ErrorCode::ObInternal,
             "invalid lifecycle state stored in database",
             Some(serde_json::json!({"lifecycle_state": value})),
+        )
+    })
+}
+
+fn conflict_status_from_row(value: &str) -> Result<ConflictStatus, ErrorEnvelope> {
+    use std::str::FromStr;
+    ConflictStatus::from_str(value).map_err(|_| {
+        ErrorEnvelope::new(
+            ErrorCode::ObInternal,
+            "invalid conflict status stored in database",
+            Some(serde_json::json!({"conflict_status": value})),
         )
     })
 }

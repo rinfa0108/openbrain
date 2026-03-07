@@ -15,6 +15,38 @@ pub enum LifecycleState {
     Deprecated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictStatus {
+    #[default]
+    None,
+    Unresolved,
+    Resolved,
+}
+
+impl ConflictStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unresolved => "unresolved",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+impl std::str::FromStr for ConflictStatus {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "unresolved" => Ok(Self::Unresolved),
+            "resolved" => Ok(Self::Resolved),
+            _ => Err(()),
+        }
+    }
+}
+
 impl LifecycleState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -134,6 +166,14 @@ pub struct MemoryObject {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_status: Option<ConflictStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
 }
 
 impl MemoryObject {
@@ -232,6 +272,25 @@ impl MemoryObject {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let resolved_by_object_id = self
+            .resolved_by_object_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let resolved_at = self
+            .resolved_at
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let resolution_note = self
+            .resolution_note
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let conflict_status = self.conflict_status.unwrap_or(ConflictStatus::None);
 
         Ok(ValidatedMemoryObject {
             object_type,
@@ -245,6 +304,10 @@ impl MemoryObject {
             lifecycle_state,
             expires_at,
             memory_key,
+            conflict_status,
+            resolved_by_object_id,
+            resolved_at,
+            resolution_note,
         })
     }
 }
@@ -262,6 +325,10 @@ pub struct ValidatedMemoryObject {
     pub lifecycle_state: LifecycleState,
     pub expires_at: Option<String>,
     pub memory_key: Option<String>,
+    pub conflict_status: ConflictStatus,
+    pub resolved_by_object_id: Option<String>,
+    pub resolved_at: Option<String>,
+    pub resolution_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -283,6 +350,14 @@ pub struct MemoryObjectStored {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_key: Option<String>,
+    #[serde(default)]
+    pub conflict_status: ConflictStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -323,6 +398,10 @@ mod tests {
             lifecycle_state: None,
             expires_at: None,
             memory_key: None,
+            conflict_status: None,
+            resolved_by_object_id: None,
+            resolved_at: None,
+            resolution_note: None,
         };
 
         let validated = obj.validate().expect("valid");
@@ -347,6 +426,47 @@ mod tests {
         assert_eq!(
             LifecycleState::from_str("deprecated").ok(),
             Some(LifecycleState::Deprecated)
+        );
+    }
+
+    #[test]
+    fn conflict_status_defaults_to_none() {
+        let obj = MemoryObject {
+            object_type: Some("claim".to_string()),
+            id: Some("obj-1".to_string()),
+            scope: Some("scope-1".to_string()),
+            status: Some("draft".to_string()),
+            spec_version: Some(SPEC_VERSION.to_string()),
+            tags: Some(vec![]),
+            data: Some(serde_json::json!({"k":"v"})),
+            provenance: Some(serde_json::json!({"actor":"tester"})),
+            lifecycle_state: Some(LifecycleState::Accepted),
+            expires_at: None,
+            memory_key: None,
+            conflict_status: None,
+            resolved_by_object_id: None,
+            resolved_at: None,
+            resolution_note: None,
+        };
+        let validated = obj.validate().expect("valid");
+        assert_eq!(validated.conflict_status, ConflictStatus::None);
+        assert_eq!(validated.resolved_by_object_id, None);
+    }
+
+    #[test]
+    fn conflict_status_parsing_accepts_known_values() {
+        use std::str::FromStr;
+        assert_eq!(
+            ConflictStatus::from_str("none").ok(),
+            Some(ConflictStatus::None)
+        );
+        assert_eq!(
+            ConflictStatus::from_str("unresolved").ok(),
+            Some(ConflictStatus::Unresolved)
+        );
+        assert_eq!(
+            ConflictStatus::from_str("resolved").ok(),
+            Some(ConflictStatus::Resolved)
         );
     }
 }

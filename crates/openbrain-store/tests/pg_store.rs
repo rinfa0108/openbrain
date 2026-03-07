@@ -42,6 +42,10 @@ fn valid_object(id: &str, scope: &str, spec_version: &str) -> MemoryObject {
         lifecycle_state: None,
         expires_at: None,
         memory_key: None,
+        conflict_status: None,
+        resolved_by_object_id: None,
+        resolved_at: None,
+        resolution_note: None,
     }
 }
 
@@ -79,6 +83,7 @@ async fn roundtrip_write_read() {
             refs: vec![id.clone()],
             include_states: None,
             include_expired: None,
+            include_conflicts: None,
             now: None,
         })
         .await;
