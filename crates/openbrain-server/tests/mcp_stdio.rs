@@ -67,6 +67,36 @@ fn create_workspace_token(pool: &PgPool, role: &str) -> (String, String) {
     })
 }
 
+fn create_token_for_workspace(pool: &PgPool, workspace_id: &str, role: &str) -> String {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async move {
+        let token = format!("ob_test_{}", uuid::Uuid::new_v4());
+        let token_hash = openbrain_store::hash_token(&token);
+        let identity_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query("INSERT INTO ob_identities (id, display_name) VALUES ($1, $2)")
+            .bind(&identity_id)
+            .bind("test-identity")
+            .execute(pool)
+            .await
+            .expect("insert identity");
+
+        sqlx::query(
+            "INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&token_hash)
+        .bind(&identity_id)
+        .bind(workspace_id)
+        .bind(role)
+        .bind("test")
+        .execute(pool)
+        .await
+        .expect("insert token");
+
+        token
+    })
+}
+
 #[test]
 fn mcp_stdio_ping_smoke() {
     let Some(pool) = setup_pool() else {
@@ -418,4 +448,175 @@ fn mcp_stdio_lifecycle_filters_read() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn mcp_policy_denies_reader_decision_read() {
+    let Some(pool) = setup_pool() else {
+        return;
+    };
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner");
+    let reader_token = create_token_for_workspace(&pool, &workspace_id, "reader");
+
+    let mut owner_child = Command::new(env!("CARGO_BIN_EXE_openbrain"))
+        .arg("mcp")
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("db url"),
+        )
+        .env("OPENBRAIN_EMBED_PROVIDER", "noop")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn owner mcp");
+
+    let mut owner_stdin = owner_child.stdin.take().expect("stdin");
+    let owner_stdout = owner_child.stdout.take().expect("stdout");
+    let decision_id = format!("decision-{}", uuid::Uuid::new_v4());
+
+    writeln!(
+        owner_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"0","auth_token": owner_token}
+        })
+    )
+    .expect("init owner");
+    writeln!(
+        owner_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"openbrain.write","arguments":{"objects":[{
+                "type":"policy.rule",
+                "id":format!("policy-{}", uuid::Uuid::new_v4()),
+                "scope":workspace_id,
+                "status":"canonical",
+                "spec_version":"0.1",
+                "tags":[],
+                "data":{
+                    "id":"deny-reader-decision",
+                    "effect":"deny",
+                    "operations":["read","search_structured","search_semantic"],
+                    "roles":["reader"],
+                    "object_kinds":["decision"],
+                    "reason":"OB_POLICY_DENY_DECISION_READ"
+                },
+                "provenance":{"actor":"owner"}
+            }]}}
+        })
+    )
+    .expect("policy write");
+    writeln!(
+        owner_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{"name":"openbrain.write","arguments":{"objects":[{
+                "type":"decision",
+                "id":decision_id,
+                "scope":workspace_id,
+                "status":"draft",
+                "spec_version":"0.1",
+                "tags":[],
+                "data":{"k":"v"},
+                "provenance":{"actor":"owner"}
+            }]}}
+        })
+    )
+    .expect("decision write");
+    drop(owner_stdin);
+
+    let owner_reader = BufReader::new(owner_stdout);
+    let mut policy_ok = false;
+    let mut write_ok = false;
+    for line in owner_reader.lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).expect("stdout JSON");
+        if v.get("id").and_then(|id| id.as_i64()) == Some(2) {
+            policy_ok = v
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|b| b.as_bool())
+                == Some(true);
+        }
+        if v.get("id").and_then(|id| id.as_i64()) == Some(3) {
+            write_ok = v
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|b| b.as_bool())
+                == Some(true);
+            break;
+        }
+    }
+    assert!(policy_ok);
+    assert!(write_ok);
+    let _ = owner_child.kill();
+    let _ = owner_child.wait();
+
+    let mut reader_child = Command::new(env!("CARGO_BIN_EXE_openbrain"))
+        .arg("mcp")
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("db url"),
+        )
+        .env("OPENBRAIN_EMBED_PROVIDER", "noop")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn reader mcp");
+    let mut reader_stdin = reader_child.stdin.take().expect("stdin");
+    let reader_stdout = reader_child.stdout.take().expect("stdout");
+
+    writeln!(
+        reader_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"0","auth_token": reader_token}
+        })
+    )
+    .expect("init reader");
+    writeln!(
+        reader_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"openbrain.read","arguments":{"scope":workspace_id,"refs":[decision_id]}}
+        })
+    )
+    .expect("reader read");
+    drop(reader_stdin);
+
+    let mut saw_forbidden = false;
+    let reader = BufReader::new(reader_stdout);
+    for line in reader.lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).expect("stdout JSON");
+        if v.get("id").and_then(|id| id.as_i64()) == Some(2) {
+            let code = v
+                .get("result")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("code"))
+                .and_then(|s| s.as_str());
+            if code == Some("OB_FORBIDDEN") {
+                saw_forbidden = true;
+            }
+            break;
+        }
+    }
+    assert!(saw_forbidden);
+    let _ = reader_child.kill();
+    let _ = reader_child.wait();
 }

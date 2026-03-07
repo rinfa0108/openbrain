@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use openbrain_server::auth;
+use openbrain_server::policy;
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -306,6 +307,74 @@ where
             if let Err(e) = auth::ensure_object_scopes(auth_ctx, &req.objects) {
                 return Envelope::err(e);
             }
+            if let Err(e) = policy::validate_policy_write_permissions(auth_ctx.role, &req.objects) {
+                return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let refs: Vec<String> = req.objects.iter().filter_map(|o| o.id.clone()).collect();
+            let mut existing =
+                std::collections::HashMap::<String, openbrain_core::LifecycleState>::new();
+            if !refs.is_empty() {
+                let current = store
+                    .get_objects(GetObjectsRequest {
+                        scope: auth_ctx.workspace_id.clone(),
+                        refs,
+                        include_states: Some(vec![
+                            openbrain_core::LifecycleState::Scratch,
+                            openbrain_core::LifecycleState::Candidate,
+                            openbrain_core::LifecycleState::Accepted,
+                            openbrain_core::LifecycleState::Deprecated,
+                        ]),
+                        include_expired: Some(true),
+                        include_conflicts: Some(false),
+                        now: None,
+                    })
+                    .await;
+                if let Envelope::Ok { data, .. } = current {
+                    for obj in data.objects {
+                        existing.insert(obj.id, obj.lifecycle_state);
+                    }
+                }
+            }
+            for obj in &req.objects {
+                let next = obj
+                    .lifecycle_state
+                    .unwrap_or(openbrain_core::LifecycleState::Accepted);
+                let prev = obj.id.as_ref().and_then(|id| existing.get(id).copied());
+                let transition = policy::lifecycle_transition(prev, next);
+                let decision = policy::evaluate(
+                    &policies,
+                    &policy::EvalInput {
+                        identity_id: &auth_ctx.identity_id,
+                        role: auth_ctx.role,
+                        operation: policy::PolicyOperation::Write,
+                        object_kind: obj.object_type.as_deref(),
+                        memory_key: obj.memory_key.as_deref(),
+                        lifecycle_transition: transition.as_deref(),
+                    },
+                );
+                if !decision.allowed {
+                    return Envelope::err(policy::deny_error(
+                        decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                        Some(serde_json::json!({"object_id": obj.id, "operation": "write"})),
+                    ));
+                }
+                if let Some(max_bytes) = decision.max_write_bytes {
+                    let payload_size = serde_json::to_vec(obj).map(|b| b.len()).unwrap_or(0) as u64;
+                    if payload_size > max_bytes {
+                        return Envelope::err(policy::deny_error(
+                            "OB_POLICY_DENY_MAX_WRITE_BYTES",
+                            Some(
+                                serde_json::json!({"object_id": obj.id, "max_write_bytes": max_bytes, "payload_bytes": payload_size}),
+                            ),
+                        ));
+                    }
+                }
+            }
 
             envelope_to_value(store.put_objects(req).await)
         }
@@ -332,6 +401,11 @@ where
             if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
 
             let resp = store
                 .get_objects(GetObjectsRequest {
@@ -346,6 +420,27 @@ where
 
             match resp {
                 Envelope::Ok { ok: _, data } => {
+                    for object in &data.objects {
+                        let decision = policy::evaluate(
+                            &policies,
+                            &policy::EvalInput {
+                                identity_id: &auth_ctx.identity_id,
+                                role: auth_ctx.role,
+                                operation: policy::PolicyOperation::Read,
+                                object_kind: Some(object.object_type.as_str()),
+                                memory_key: object.memory_key.as_deref(),
+                                lifecycle_transition: None,
+                            },
+                        );
+                        if !decision.allowed {
+                            return Envelope::err(policy::deny_error(
+                                decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                                Some(
+                                    serde_json::json!({"object_id": object.id, "operation": "read"}),
+                                ),
+                            ));
+                        }
+                    }
                     let mismatched: Vec<String> = data
                         .objects
                         .iter()
@@ -375,7 +470,7 @@ where
             }
 
             let args = call.arguments.unwrap_or(Value::Null);
-            let req: SearchStructuredRequest = match serde_json::from_value(args) {
+            let mut req: SearchStructuredRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
                 Err(e) => {
                     return env_err(
@@ -389,8 +484,49 @@ where
             if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
-
-            envelope_to_value(store.search_structured(req).await)
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::SearchStructured,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error(
+                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    Some(serde_json::json!({"operation":"search_structured"})),
+                ));
+            }
+            req.limit = policy::clamp_u32(req.limit, decision.max_top_k);
+            match store.search_structured(req).await {
+                Envelope::Ok { ok, mut data } => {
+                    data.results.retain(|item| {
+                        policy::evaluate(
+                            &policies,
+                            &policy::EvalInput {
+                                identity_id: &auth_ctx.identity_id,
+                                role: auth_ctx.role,
+                                operation: policy::PolicyOperation::SearchStructured,
+                                object_kind: Some(item.object_type.as_str()),
+                                memory_key: None,
+                                lifecycle_transition: None,
+                            },
+                        )
+                        .allowed
+                    });
+                    envelope_to_value(Envelope::Ok { ok, data })
+                }
+                Envelope::Err { ok, error } => Envelope::Err { ok, error },
+            }
         }
         "openbrain.embed.generate" => {
             let Some(auth_ctx) = auth_ctx else {
@@ -415,6 +551,28 @@ where
             if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::EmbedGenerate,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error(
+                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    Some(serde_json::json!({"operation":"embed_generate"})),
+                ));
+            }
 
             envelope_to_value(store.embed_generate(req).await)
         }
@@ -427,7 +585,7 @@ where
             }
 
             let args = call.arguments.unwrap_or(Value::Null);
-            let req: SearchSemanticRequest = match serde_json::from_value(args) {
+            let mut req: SearchSemanticRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
                 Err(e) => {
                     return env_err(
@@ -441,8 +599,49 @@ where
             if let Err(e) = auth::ensure_scope(auth_ctx, &req.scope) {
                 return Envelope::err(e);
             }
-
-            envelope_to_value(store.search_semantic(req).await)
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::SearchSemantic,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error(
+                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    Some(serde_json::json!({"operation":"search_semantic"})),
+                ));
+            }
+            req.top_k = policy::clamp_u32(req.top_k, decision.max_top_k);
+            match store.search_semantic(req).await {
+                Envelope::Ok { ok, mut data } => {
+                    data.matches.retain(|item| {
+                        policy::evaluate(
+                            &policies,
+                            &policy::EvalInput {
+                                identity_id: &auth_ctx.identity_id,
+                                role: auth_ctx.role,
+                                operation: policy::PolicyOperation::SearchSemantic,
+                                object_kind: Some(item.kind.as_str()),
+                                memory_key: None,
+                                lifecycle_transition: None,
+                            },
+                        )
+                        .allowed
+                    });
+                    envelope_to_value(Envelope::Ok { ok, data })
+                }
+                Envelope::Err { ok, error } => Envelope::Err { ok, error },
+            }
         }
         "openbrain.rerank" => {
             let Some(auth_ctx) = auth_ctx else {
@@ -502,6 +701,28 @@ where
             };
             if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Admin) {
                 return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::Admin,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error(
+                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    Some(serde_json::json!({"operation":"admin"})),
+                ));
             }
 
             #[derive(Debug, Deserialize)]
