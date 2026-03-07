@@ -238,6 +238,76 @@ async fn embed_generate_allows_multiple_providers_for_same_object() {
 }
 
 #[tokio::test]
+async fn embed_generate_allows_multiple_models_for_same_object() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+
+    let store = PgStore::from_pool_with_embedder(pool, Arc::new(FakeEmbeddingProvider));
+
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let id = format!("obj-{}", Uuid::new_v4());
+    let model_a = "fake-v1".to_string();
+    let model_b = "fake-v2".to_string();
+    let text = "shared text for model-aware embeddings".to_string();
+
+    let _ = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![obj_claim(&id, &scope)],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let first = store
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Text { text: text.clone() },
+            model: model_a,
+            dims: None,
+        })
+        .await;
+
+    let first_id = match first {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.reused);
+            data.embedding_id
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    };
+
+    let second = store
+        .embed_generate(EmbedGenerateRequest {
+            scope: scope.clone(),
+            target: EmbedTarget::Text { text: text.clone() },
+            model: model_b,
+            dims: None,
+        })
+        .await;
+
+    let second_id = match second {
+        Envelope::Ok { data, .. } => {
+            assert!(!data.reused);
+            data.embedding_id
+        }
+        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+    };
+
+    assert_ne!(first_id, second_id);
+
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM ob_embeddings WHERE scope = $1 AND object_id = $2"#,
+    )
+    .bind(&scope)
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .expect("count embeddings");
+
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn embed_generate_ref_stores_object_id() {
     let Some(pool) = setup_pool().await else {
         return;
