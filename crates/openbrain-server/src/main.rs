@@ -630,6 +630,7 @@ async fn run_embed_command(
                     return Err(EmbedCommandError::Api(policy::deny_error_with_rule(
                         decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
                         decision.policy_rule_id.as_deref(),
+                        None,
                     )));
                 }
             }
