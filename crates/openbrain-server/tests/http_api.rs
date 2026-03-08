@@ -127,6 +127,33 @@ async fn create_workspace_token(pool: &PgPool, role: &str) -> (String, String) {
     (token, workspace_id)
 }
 
+async fn create_token_for_workspace(pool: &PgPool, workspace_id: &str, role: &str) -> String {
+    let token = format!("ob_test_{}", uuid::Uuid::new_v4());
+    let token_hash = hash_token(&token);
+    let identity_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query("INSERT INTO ob_identities (id, display_name) VALUES ($1, $2)")
+        .bind(&identity_id)
+        .bind("test-identity")
+        .execute(pool)
+        .await
+        .expect("insert identity");
+
+    sqlx::query(
+        "INSERT INTO ob_tokens (token_hash, identity_id, workspace_id, role, label) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&token_hash)
+    .bind(&identity_id)
+    .bind(workspace_id)
+    .bind(role)
+    .bind("test")
+    .execute(pool)
+    .await
+    .expect("insert token");
+
+    token
+}
+
 #[tokio::test]
 async fn http_ping_write_read_and_structured_search() {
     let Some(server) = TestServer::spawn().await else {
@@ -675,6 +702,248 @@ async fn http_policy_denies_reader_decision_and_writer_promotion() {
             .and_then(|v| v.as_str()),
         Some("OB_FORBIDDEN")
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_governance_workspace_audit_retention_and_explainability() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+    let pool = setup_pool().await.expect("pool");
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner").await;
+    let reader_token = create_token_for_workspace(&pool, &workspace_id, "reader").await;
+    let client = reqwest::Client::new();
+    let base = server.base.clone();
+
+    let info = client
+        .post(format!("{}/v1/workspace/info", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("workspace info")
+        .json::<serde_json::Value>()
+        .await
+        .expect("workspace info json");
+    assert_eq!(info.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        info.get("workspace_id").and_then(|v| v.as_str()),
+        Some(workspace_id.as_str())
+    );
+
+    let retention_id = format!("policy-retention-{}", uuid::Uuid::new_v4());
+    let retention_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "objects": [{
+                "type":"policy.retention",
+                "id": retention_id,
+                "scope": workspace_id,
+                "status":"canonical",
+                "spec_version":"0.1",
+                "tags":[],
+                "data":{
+                    "default_ttl_by_kind":{"decision": 3},
+                    "max_ttl_by_kind":{"pii": 30},
+                    "immutable_kinds":["pii"]
+                },
+                "provenance":{"actor":"owner"}
+            }]
+        }))
+        .send()
+        .await
+        .expect("retention write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("retention write json");
+    assert_eq!(
+        retention_write.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let obj_id = format!("decision-{}", uuid::Uuid::new_v4());
+    let write_decision = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "objects": [{
+                "type":"decision",
+                "id": obj_id,
+                "scope": workspace_id,
+                "status":"draft",
+                "spec_version":"0.1",
+                "tags":[],
+                "memory_key":"decision:db",
+                "data":{"choice":"pg"},
+                "provenance":{"actor":"owner"},
+                "lifecycle_state":"scratch"
+            }]
+        }))
+        .send()
+        .await
+        .expect("decision write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("decision write json");
+    assert_eq!(
+        write_decision.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let read_decision = client
+        .post(format!("{}/v1/read", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "scope": workspace_id,
+            "refs": [obj_id],
+            "include_states": ["scratch"],
+            "include_expired": true
+        }))
+        .send()
+        .await
+        .expect("decision read")
+        .json::<serde_json::Value>()
+        .await
+        .expect("decision read json");
+    let expires = read_decision["objects"][0]["expires_at"].as_str();
+    assert!(
+        expires.is_some(),
+        "retention default ttl should set expires_at"
+    );
+
+    let too_long = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let pii_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "objects": [{
+                "type":"pii",
+                "id": format!("pii-{}", uuid::Uuid::new_v4()),
+                "scope": workspace_id,
+                "status":"draft",
+                "spec_version":"0.1",
+                "tags":[],
+                "data":{"v":"secret"},
+                "provenance":{"actor":"owner"},
+                "expires_at": too_long
+            }]
+        }))
+        .send()
+        .await
+        .expect("pii write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("pii write json");
+    assert_eq!(
+        pii_write["error"]["code"].as_str(),
+        Some("OB_FORBIDDEN"),
+        "immutable kind over max ttl must be denied"
+    );
+    assert!(pii_write["error"]["details"]["policy_rule_id"].is_string());
+    assert!(pii_write["error"]["details"]["reason_code"].is_string());
+
+    let audit_obj = client
+        .post(format!("{}/v1/audit/object_timeline", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "scope": workspace_id,
+            "object_id": read_decision["objects"][0]["id"],
+            "limit": 20
+        }))
+        .send()
+        .await
+        .expect("audit obj")
+        .json::<serde_json::Value>()
+        .await
+        .expect("audit obj json");
+    assert_eq!(audit_obj.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert!(audit_obj["events"]
+        .as_array()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false));
+
+    let audit_key = client
+        .post(format!("{}/v1/audit/memory_key_timeline", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({"scope": workspace_id, "memory_key":"decision:db", "limit": 20}))
+        .send()
+        .await
+        .expect("audit key")
+        .json::<serde_json::Value>()
+        .await
+        .expect("audit key json");
+    assert_eq!(audit_key.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let audit_actor = client
+        .post(format!("{}/v1/audit/actor_activity", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({"scope": workspace_id, "actor_identity_id":"owner", "limit": 20}))
+        .send()
+        .await
+        .expect("audit actor")
+        .json::<serde_json::Value>()
+        .await
+        .expect("audit actor json");
+    assert_eq!(audit_actor.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let deny_audit_policy = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&json!({
+            "objects": [{
+                "type":"policy.rule",
+                "id": format!("policy-{}", uuid::Uuid::new_v4()),
+                "scope": workspace_id,
+                "status":"canonical",
+                "spec_version":"0.1",
+                "tags":[],
+                "data":{
+                    "id":"deny-reader-audit",
+                    "effect":"deny",
+                    "operations":["audit_object_timeline"],
+                    "roles":["reader"],
+                    "reason":"OB_POLICY_DENY_AUDIT_READ"
+                },
+                "provenance":{"actor":"owner"}
+            }]
+        }))
+        .send()
+        .await
+        .expect("deny audit policy")
+        .json::<serde_json::Value>()
+        .await
+        .expect("deny audit policy json");
+    assert_eq!(
+        deny_audit_policy.get("ok").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let reader_denied = client
+        .post(format!("{}/v1/audit/object_timeline", base))
+        .bearer_auth(&reader_token)
+        .json(&json!({
+            "scope": workspace_id,
+            "object_id": read_decision["objects"][0]["id"],
+            "limit": 20
+        }))
+        .send()
+        .await
+        .expect("reader denied")
+        .json::<serde_json::Value>()
+        .await
+        .expect("reader denied json");
+    assert_eq!(
+        reader_denied["error"]["code"].as_str(),
+        Some("OB_FORBIDDEN")
+    );
+    assert_eq!(
+        reader_denied["error"]["details"]["reason_code"].as_str(),
+        Some("OB_POLICY_DENY_AUDIT_READ")
+    );
+    assert!(reader_denied["error"]["details"]["policy_rule_id"].is_string());
 
     server.shutdown().await;
 }

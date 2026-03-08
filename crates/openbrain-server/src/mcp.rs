@@ -2,6 +2,7 @@ use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope, SPEC_VERSION};
 use openbrain_llm::AnthropicClient;
 use openbrain_server::service;
 use openbrain_store::{
+    AuditActorActivityRequest, AuditMemoryKeyTimelineRequest, AuditObjectTimelineRequest,
     AuthContext, AuthStore, EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest,
     SearchSemanticRequest, SearchStructuredRequest, Store, TokenCreateRequest, WorkspaceRole,
 };
@@ -239,7 +240,11 @@ where
                     {"name":"openbrain.search.semantic","description":"Semantic search","inputSchema": {"type":"object"}},
                     {"name":"openbrain.rerank","description":"Rerank candidates","inputSchema": {"type":"object"}},
                     {"name":"openbrain.memory.pack","description":"Build memory pack","inputSchema": {"type":"object"}},
-                    {"name":"openbrain.workspace.token.create","description":"Create workspace token","inputSchema": {"type":"object"}}
+                    {"name":"openbrain.workspace.token.create","description":"Create workspace token","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.workspace.info","description":"Get workspace ownership and caller role","inputSchema": {"type":"object","properties":{},"additionalProperties":false}},
+                    {"name":"openbrain.audit.object_timeline","description":"Audit timeline by object id","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.audit.memory_key_timeline","description":"Audit timeline by memory key","inputSchema": {"type":"object"}},
+                    {"name":"openbrain.audit.actor_activity","description":"Audit activity by actor identity","inputSchema": {"type":"object"}}
                 ]
             });
             RpcResponse::result(id, tools)
@@ -294,7 +299,7 @@ where
             }
 
             let args = call.arguments.unwrap_or(Value::Null);
-            let req: PutObjectsRequest = match serde_json::from_value(args) {
+            let mut req: PutObjectsRequest = match serde_json::from_value(args) {
                 Ok(v) => v,
                 Err(e) => {
                     return env_err(
@@ -315,6 +320,19 @@ where
                     Ok(v) => v,
                     Err(e) => return Envelope::err(e),
                 };
+            let retention =
+                match policy::load_workspace_retention_policy(&store, &auth_ctx.workspace_id).await
+                {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            if let Err(e) = policy::apply_retention_policy_to_objects(
+                retention.as_ref(),
+                &mut req.objects,
+                chrono::Utc::now(),
+            ) {
+                return Envelope::err(e);
+            }
             let refs: Vec<String> = req.objects.iter().filter_map(|o| o.id.clone()).collect();
             let mut existing =
                 std::collections::HashMap::<String, openbrain_core::LifecycleState>::new();
@@ -358,16 +376,18 @@ where
                     },
                 );
                 if !decision.allowed {
-                    return Envelope::err(policy::deny_error(
-                        decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    return Envelope::err(policy::deny_error_with_rule(
+                        decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                        decision.policy_rule_id.as_deref(),
                         Some(serde_json::json!({"object_id": obj.id, "operation": "write"})),
                     ));
                 }
                 if let Some(max_bytes) = decision.max_write_bytes {
                     let payload_size = serde_json::to_vec(obj).map(|b| b.len()).unwrap_or(0) as u64;
                     if payload_size > max_bytes {
-                        return Envelope::err(policy::deny_error(
+                        return Envelope::err(policy::deny_error_with_rule(
                             "OB_POLICY_DENY_MAX_WRITE_BYTES",
+                            decision.policy_rule_id.as_deref(),
                             Some(
                                 serde_json::json!({"object_id": obj.id, "max_write_bytes": max_bytes, "payload_bytes": payload_size}),
                             ),
@@ -433,8 +453,9 @@ where
                             },
                         );
                         if !decision.allowed {
-                            return Envelope::err(policy::deny_error(
-                                decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                            return Envelope::err(policy::deny_error_with_rule(
+                                decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                                decision.policy_rule_id.as_deref(),
                                 Some(
                                     serde_json::json!({"object_id": object.id, "operation": "read"}),
                                 ),
@@ -501,8 +522,9 @@ where
                 },
             );
             if !decision.allowed {
-                return Envelope::err(policy::deny_error(
-                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
                     Some(serde_json::json!({"operation":"search_structured"})),
                 ));
             }
@@ -568,8 +590,9 @@ where
                 },
             );
             if !decision.allowed {
-                return Envelope::err(policy::deny_error(
-                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
                     Some(serde_json::json!({"operation":"embed_generate"})),
                 ));
             }
@@ -616,8 +639,9 @@ where
                 },
             );
             if !decision.allowed {
-                return Envelope::err(policy::deny_error(
-                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
                     Some(serde_json::json!({"operation":"search_semantic"})),
                 ));
             }
@@ -719,8 +743,9 @@ where
                 },
             );
             if !decision.allowed {
-                return Envelope::err(policy::deny_error(
-                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
                     Some(serde_json::json!({"operation":"admin"})),
                 ));
             }
@@ -758,6 +783,182 @@ where
                 Ok(v) => envelope_to_value(Envelope::ok(v)),
                 Err(e) => Envelope::err(e),
             }
+        }
+        "openbrain.workspace.info" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Read) {
+                return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::WorkspaceInfo,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
+                    Some(serde_json::json!({"operation":"workspace_info"})),
+                ));
+            }
+            match store
+                .workspace_info(&auth_ctx.workspace_id, &auth_ctx.identity_id, auth_ctx.role)
+                .await
+            {
+                Ok(v) => envelope_to_value(Envelope::ok(v)),
+                Err(e) => Envelope::err(e),
+            }
+        }
+        "openbrain.audit.object_timeline" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Read) {
+                return Envelope::err(e);
+            }
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: AuditObjectTimelineRequest = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({"error": e.to_string()})),
+                    )
+                }
+            };
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.query.scope) {
+                return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::AuditObjectTimeline,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
+                    Some(serde_json::json!({"operation":"audit_object_timeline"})),
+                ));
+            }
+            envelope_to_value(store.audit_object_timeline(req).await)
+        }
+        "openbrain.audit.memory_key_timeline" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Read) {
+                return Envelope::err(e);
+            }
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: AuditMemoryKeyTimelineRequest = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({"error": e.to_string()})),
+                    )
+                }
+            };
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.query.scope) {
+                return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::AuditMemoryKeyTimeline,
+                    object_kind: None,
+                    memory_key: Some(req.memory_key.as_str()),
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
+                    Some(serde_json::json!({"operation":"audit_memory_key_timeline"})),
+                ));
+            }
+            envelope_to_value(store.audit_memory_key_timeline(req).await)
+        }
+        "openbrain.audit.actor_activity" => {
+            let Some(auth_ctx) = auth_ctx else {
+                return unauthenticated();
+            };
+            if let Err(e) = auth::authorize(auth_ctx, auth::Operation::Read) {
+                return Envelope::err(e);
+            }
+            let args = call.arguments.unwrap_or(Value::Null);
+            let req: AuditActorActivityRequest = match serde_json::from_value(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return env_err(
+                        ErrorCode::ObInvalidRequest,
+                        "invalid JSON",
+                        Some(serde_json::json!({"error": e.to_string()})),
+                    )
+                }
+            };
+            if let Err(e) = auth::ensure_scope(auth_ctx, &req.query.scope) {
+                return Envelope::err(e);
+            }
+            let policies =
+                match policy::load_workspace_policies(&store, &auth_ctx.workspace_id).await {
+                    Ok(v) => v,
+                    Err(e) => return Envelope::err(e),
+                };
+            let decision = policy::evaluate(
+                &policies,
+                &policy::EvalInput {
+                    identity_id: &auth_ctx.identity_id,
+                    role: auth_ctx.role,
+                    operation: policy::PolicyOperation::AuditActorActivity,
+                    object_kind: None,
+                    memory_key: None,
+                    lifecycle_transition: None,
+                },
+            );
+            if !decision.allowed {
+                return Envelope::err(policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
+                    Some(serde_json::json!({"operation":"audit_actor_activity"})),
+                ));
+            }
+            envelope_to_value(store.audit_actor_activity(req).await)
         }
         _ => env_err(
             ErrorCode::ObInvalidRequest,

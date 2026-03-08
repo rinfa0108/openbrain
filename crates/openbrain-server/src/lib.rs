@@ -12,8 +12,10 @@ pub mod auth;
 pub mod policy;
 pub mod service;
 use openbrain_store::{
-    AuthStore, EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest, SearchSemanticRequest,
-    SearchStructuredRequest, Store, TokenCreateRequest, TokenCreateResponse, WorkspaceRole,
+    AuditActorActivityRequest, AuditMemoryKeyTimelineRequest, AuditObjectTimelineRequest,
+    AuditResponse, AuthStore, EmbedGenerateRequest, GetObjectsRequest, PutObjectsRequest,
+    SearchSemanticRequest, SearchStructuredRequest, Store, TokenCreateRequest, TokenCreateResponse,
+    WorkspaceInfoResponse, WorkspaceRole,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -50,6 +52,16 @@ where
             "/v1/workspace/token/create",
             post(workspace_token_create::<S>),
         )
+        .route("/v1/workspace/info", post(workspace_info::<S>))
+        .route(
+            "/v1/audit/object_timeline",
+            post(audit_object_timeline::<S>),
+        )
+        .route(
+            "/v1/audit/memory_key_timeline",
+            post(audit_memory_key_timeline::<S>),
+        )
+        .route("/v1/audit/actor_activity", post(audit_actor_activity::<S>))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -131,7 +143,7 @@ where
         return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e));
     }
 
-    let req = match parse_json_body::<PutObjectsRequest>(body) {
+    let mut req = match parse_json_body::<PutObjectsRequest>(body) {
         Ok(v) => v,
         Err(e) => return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e)),
     };
@@ -148,6 +160,20 @@ where
         Ok(v) => v,
         Err(e) => return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e)),
     };
+    let retention =
+        match policy::load_workspace_retention_policy(&state.store, &auth.workspace_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e));
+            }
+        };
+    if let Err(e) = policy::apply_retention_policy_to_objects(
+        retention.as_ref(),
+        &mut req.objects,
+        chrono::Utc::now(),
+    ) {
+        return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(e));
+    }
 
     let refs: Vec<String> = req.objects.iter().filter_map(|o| o.id.clone()).collect();
     let mut existing = std::collections::HashMap::<String, openbrain_core::LifecycleState>::new();
@@ -194,8 +220,9 @@ where
         );
         if !decision.allowed {
             return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(
-                policy::deny_error(
-                    decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+                policy::deny_error_with_rule(
+                    decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                    decision.policy_rule_id.as_deref(),
                     Some(serde_json::json!({"object_id": obj.id, "operation": "write"})),
                 ),
             ));
@@ -204,8 +231,9 @@ where
             let payload_size = serde_json::to_vec(obj).map(|b| b.len()).unwrap_or(0) as u64;
             if payload_size > max_bytes {
                 return Json::<Envelope<openbrain_store::PutObjectsResponse>>(Envelope::err(
-                    policy::deny_error(
+                    policy::deny_error_with_rule(
                         "OB_POLICY_DENY_MAX_WRITE_BYTES",
+                        decision.policy_rule_id.as_deref(),
                         Some(
                             serde_json::json!({"object_id": obj.id, "max_write_bytes": max_bytes, "payload_bytes": payload_size}),
                         ),
@@ -302,7 +330,8 @@ where
                         ErrorCode::ObForbidden,
                         "policy denied",
                         Some(serde_json::json!({
-                            "reason": decision.reason.unwrap_or_else(|| "OB_POLICY_DENY".to_string()),
+                            "reason_code": decision.reason_code.unwrap_or_else(|| "OB_POLICY_DENY".to_string()),
+                            "policy_rule_id": decision.policy_rule_id,
                             "object_id": object.id,
                             "operation": "read"
                         })),
@@ -378,11 +407,12 @@ where
     );
     if !request_decision.allowed {
         return Json::<Envelope<openbrain_store::SearchStructuredResponse>>(Envelope::err(
-            policy::deny_error(
+            policy::deny_error_with_rule(
                 request_decision
-                    .reason
+                    .reason_code
                     .as_deref()
                     .unwrap_or("OB_POLICY_DENY"),
+                request_decision.policy_rule_id.as_deref(),
                 Some(serde_json::json!({"operation": "search_structured"})),
             ),
         ));
@@ -459,8 +489,9 @@ where
     );
     if !decision.allowed {
         return Json::<Envelope<openbrain_store::EmbedGenerateResponse>>(Envelope::err(
-            policy::deny_error(
-                decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+            policy::deny_error_with_rule(
+                decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                decision.policy_rule_id.as_deref(),
                 Some(serde_json::json!({"operation": "embed_generate"})),
             ),
         ));
@@ -517,11 +548,12 @@ where
     );
     if !request_decision.allowed {
         return Json::<Envelope<openbrain_store::SearchSemanticResponse>>(Envelope::err(
-            policy::deny_error(
+            policy::deny_error_with_rule(
                 request_decision
-                    .reason
+                    .reason_code
                     .as_deref()
                     .unwrap_or("OB_POLICY_DENY"),
+                request_decision.policy_rule_id.as_deref(),
                 Some(serde_json::json!({"operation": "search_semantic"})),
             ),
         ));
@@ -637,8 +669,9 @@ where
         },
     );
     if !decision.allowed {
-        return Json::<Envelope<TokenCreateResponse>>(Envelope::err(policy::deny_error(
-            decision.reason.as_deref().unwrap_or("OB_POLICY_DENY"),
+        return Json::<Envelope<TokenCreateResponse>>(Envelope::err(policy::deny_error_with_rule(
+            decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+            decision.policy_rule_id.as_deref(),
             Some(serde_json::json!({"operation": "admin"})),
         )));
     }
@@ -662,4 +695,202 @@ where
         Ok(v) => Json(Envelope::ok(v)),
         Err(e) => Json(Envelope::err(e)),
     }
+}
+
+async fn workspace_info<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + AuthStore + Clone + 'static,
+{
+    if let Err(e) = body {
+        return Json::<Envelope<WorkspaceInfoResponse>>(Envelope::err(ErrorEnvelope::new(
+            ErrorCode::ObInvalidRequest,
+            "invalid request body",
+            Some(serde_json::json!({ "error": e.to_string() })),
+        )));
+    }
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<WorkspaceInfoResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Read) {
+        return Json::<Envelope<WorkspaceInfoResponse>>(Envelope::err(e));
+    }
+    let policies = match policy::load_workspace_policies(&state.store, &auth.workspace_id).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<WorkspaceInfoResponse>>(Envelope::err(e)),
+    };
+    let decision = policy::evaluate(
+        &policies,
+        &policy::EvalInput {
+            identity_id: &auth.identity_id,
+            role: auth.role,
+            operation: policy::PolicyOperation::WorkspaceInfo,
+            object_kind: None,
+            memory_key: None,
+            lifecycle_transition: None,
+        },
+    );
+    if !decision.allowed {
+        return Json::<Envelope<WorkspaceInfoResponse>>(Envelope::err(
+            policy::deny_error_with_rule(
+                decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                decision.policy_rule_id.as_deref(),
+                Some(serde_json::json!({"operation": "workspace_info"})),
+            ),
+        ));
+    }
+
+    match state
+        .store
+        .workspace_info(&auth.workspace_id, &auth.identity_id, auth.role)
+        .await
+    {
+        Ok(v) => Json(Envelope::ok(v)),
+        Err(e) => Json(Envelope::err(e)),
+    }
+}
+
+async fn audit_object_timeline<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + AuthStore + Clone + 'static,
+{
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Read) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let req = match parse_json_body::<AuditObjectTimelineRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::ensure_scope(&auth, &req.query.scope) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let policies = match policy::load_workspace_policies(&state.store, &auth.workspace_id).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    let decision = policy::evaluate(
+        &policies,
+        &policy::EvalInput {
+            identity_id: &auth.identity_id,
+            role: auth.role,
+            operation: policy::PolicyOperation::AuditObjectTimeline,
+            object_kind: None,
+            memory_key: None,
+            lifecycle_transition: None,
+        },
+    );
+    if !decision.allowed {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(policy::deny_error_with_rule(
+            decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+            decision.policy_rule_id.as_deref(),
+            Some(serde_json::json!({"operation": "audit_object_timeline"})),
+        )));
+    }
+    Json(state.store.audit_object_timeline(req).await)
+}
+
+async fn audit_memory_key_timeline<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + AuthStore + Clone + 'static,
+{
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Read) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let req = match parse_json_body::<AuditMemoryKeyTimelineRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::ensure_scope(&auth, &req.query.scope) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let policies = match policy::load_workspace_policies(&state.store, &auth.workspace_id).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    let decision = policy::evaluate(
+        &policies,
+        &policy::EvalInput {
+            identity_id: &auth.identity_id,
+            role: auth.role,
+            operation: policy::PolicyOperation::AuditMemoryKeyTimeline,
+            object_kind: None,
+            memory_key: Some(req.memory_key.as_str()),
+            lifecycle_transition: None,
+        },
+    );
+    if !decision.allowed {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(policy::deny_error_with_rule(
+            decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+            decision.policy_rule_id.as_deref(),
+            Some(serde_json::json!({"operation": "audit_memory_key_timeline"})),
+        )));
+    }
+    Json(state.store.audit_memory_key_timeline(req).await)
+}
+
+async fn audit_actor_activity<S>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse
+where
+    S: Store + AuthStore + Clone + 'static,
+{
+    let auth = match auth::authenticate_bearer(&headers, &state.store).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::authorize(&auth, auth::Operation::Read) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let req = match parse_json_body::<AuditActorActivityRequest>(body) {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    if let Err(e) = auth::ensure_scope(&auth, &req.query.scope) {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(e));
+    }
+    let policies = match policy::load_workspace_policies(&state.store, &auth.workspace_id).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<AuditResponse>>(Envelope::err(e)),
+    };
+    let decision = policy::evaluate(
+        &policies,
+        &policy::EvalInput {
+            identity_id: &auth.identity_id,
+            role: auth.role,
+            operation: policy::PolicyOperation::AuditActorActivity,
+            object_kind: None,
+            memory_key: None,
+            lifecycle_transition: None,
+        },
+    );
+    if !decision.allowed {
+        return Json::<Envelope<AuditResponse>>(Envelope::err(policy::deny_error_with_rule(
+            decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+            decision.policy_rule_id.as_deref(),
+            Some(serde_json::json!({"operation": "audit_actor_activity"})),
+        )));
+    }
+    Json(state.store.audit_actor_activity(req).await)
 }

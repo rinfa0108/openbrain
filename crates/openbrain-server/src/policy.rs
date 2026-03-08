@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const POLICY_KIND: &str = "policy.rule";
+const RETENTION_KIND: &str = "policy.retention";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyOperation {
@@ -13,6 +14,10 @@ pub enum PolicyOperation {
     SearchSemantic,
     EmbedGenerate,
     Admin,
+    AuditObjectTimeline,
+    AuditMemoryKeyTimeline,
+    AuditActorActivity,
+    WorkspaceInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +56,28 @@ pub struct EvalInput<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct EvalDecision {
     pub allowed: bool,
-    pub reason: Option<String>,
+    pub reason_code: Option<String>,
+    pub policy_rule_id: Option<String>,
     pub max_top_k: Option<u32>,
     pub max_write_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RetentionPolicy {
+    pub policy_object_id: String,
+    pub default_ttl_by_kind: std::collections::HashMap<String, i64>,
+    pub max_ttl_by_kind: std::collections::HashMap<String, i64>,
+    pub immutable_kinds: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetentionData {
+    #[serde(default)]
+    default_ttl_by_kind: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    max_ttl_by_kind: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    immutable_kinds: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +120,10 @@ fn parse_operation(value: &str) -> Result<PolicyOperation, ErrorEnvelope> {
         "search_semantic" => Ok(PolicyOperation::SearchSemantic),
         "embed_generate" => Ok(PolicyOperation::EmbedGenerate),
         "admin" => Ok(PolicyOperation::Admin),
+        "audit_object_timeline" => Ok(PolicyOperation::AuditObjectTimeline),
+        "audit_memory_key_timeline" => Ok(PolicyOperation::AuditMemoryKeyTimeline),
+        "audit_actor_activity" => Ok(PolicyOperation::AuditActorActivity),
+        "workspace_info" => Ok(PolicyOperation::WorkspaceInfo),
         _ => Err(ErrorEnvelope::new(
             ErrorCode::ObInvalidSchema,
             "invalid policy operation",
@@ -257,8 +285,12 @@ fn role_is_owner(role: WorkspaceRole) -> bool {
 }
 
 fn kind_is_protected(kind: Option<&str>) -> bool {
-    kind.map(|v| v.eq_ignore_ascii_case(POLICY_KIND))
-        .unwrap_or(false)
+    kind.map(|v| {
+        v.eq_ignore_ascii_case(POLICY_KIND)
+            || v.eq_ignore_ascii_case(RETENTION_KIND)
+            || v.to_ascii_lowercase().starts_with("policy.")
+    })
+    .unwrap_or(false)
 }
 
 fn operation_matches(rule: &PolicyRule, op: PolicyOperation) -> bool {
@@ -319,7 +351,8 @@ pub fn evaluate(rules: &[PolicyRule], input: &EvalInput<'_>) -> EvalDecision {
     {
         return EvalDecision {
             allowed: false,
-            reason: Some("OB_POLICY_DENY_PROTECTED_KIND".to_string()),
+            reason_code: Some("OB_POLICY_DENY_PROTECTED_KIND".to_string()),
+            policy_rule_id: None,
             max_top_k: None,
             max_write_bytes: None,
         };
@@ -358,7 +391,8 @@ pub fn evaluate(rules: &[PolicyRule], input: &EvalInput<'_>) -> EvalDecision {
         if matches!(rule.effect, RuleEffect::Deny) {
             return EvalDecision {
                 allowed: false,
-                reason: Some(rule.reason.clone()),
+                reason_code: Some(rule.reason.clone()),
+                policy_rule_id: Some(rule.id.clone()),
                 max_top_k,
                 max_write_bytes,
             };
@@ -367,7 +401,8 @@ pub fn evaluate(rules: &[PolicyRule], input: &EvalInput<'_>) -> EvalDecision {
 
     EvalDecision {
         allowed: true,
-        reason: None,
+        reason_code: None,
+        policy_rule_id: None,
         max_top_k,
         max_write_bytes,
     }
@@ -384,7 +419,7 @@ pub fn validate_policy_write_permissions(
     let has_policy_obj = objects.iter().any(|o| {
         o.object_type
             .as_ref()
-            .map(|t| t.eq_ignore_ascii_case(POLICY_KIND))
+            .map(|t| t.to_ascii_lowercase().starts_with("policy."))
             .unwrap_or(false)
     });
     if has_policy_obj {
@@ -407,11 +442,20 @@ pub fn lifecycle_transition(
 }
 
 pub fn deny_error(reason: &str, details: Option<Value>) -> ErrorEnvelope {
+    deny_error_with_rule(reason, None, details)
+}
+
+pub fn deny_error_with_rule(
+    reason_code: &str,
+    policy_rule_id: Option<&str>,
+    details: Option<Value>,
+) -> ErrorEnvelope {
     ErrorEnvelope::new(
         ErrorCode::ObForbidden,
         "policy denied",
         Some(serde_json::json!({
-            "reason": reason,
+            "reason_code": reason_code,
+            "policy_rule_id": policy_rule_id,
             "details": details.unwrap_or(Value::Null)
         })),
     )
@@ -424,6 +468,168 @@ pub fn clamp_u32(requested: Option<u32>, max_value: Option<u32>) -> Option<u32> 
         (Some(v), None) => Some(v),
         (None, None) => None,
     }
+}
+
+fn normalize_kind_map(
+    src: std::collections::HashMap<String, i64>,
+) -> std::collections::HashMap<String, i64> {
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in src {
+        let key = k.trim().to_ascii_lowercase();
+        if !key.is_empty() && v >= 0 {
+            out.insert(key, v);
+        }
+    }
+    out
+}
+
+pub async fn load_workspace_retention_policy<S>(
+    store: &S,
+    workspace_id: &str,
+) -> Result<Option<RetentionPolicy>, ErrorEnvelope>
+where
+    S: Store + ?Sized,
+{
+    let search = store
+        .search_structured(SearchStructuredRequest {
+            scope: workspace_id.to_string(),
+            where_expr: Some("type == \"policy.retention\"".to_string()),
+            limit: Some(1),
+            offset: Some(0),
+            order_by: Some(openbrain_store::OrderBySpec {
+                field: "updated_at".to_string(),
+                direction: openbrain_store::OrderDirection::Desc,
+            }),
+            include_states: Some(vec![LifecycleState::Accepted]),
+            include_expired: Some(false),
+            now: None,
+            include_conflicts: Some(false),
+        })
+        .await;
+    let object_id = match search {
+        Envelope::Ok { data, .. } => data.results.into_iter().next().map(|r| r.r#ref),
+        Envelope::Err { error, .. } => return Err(error),
+    };
+    let Some(object_id) = object_id else {
+        return Ok(None);
+    };
+
+    let read = store
+        .get_objects(GetObjectsRequest {
+            scope: workspace_id.to_string(),
+            refs: vec![object_id.clone()],
+            include_states: Some(vec![LifecycleState::Accepted]),
+            include_expired: Some(false),
+            now: None,
+            include_conflicts: Some(false),
+        })
+        .await;
+    let obj = match read {
+        Envelope::Ok { data, .. } => data.objects.into_iter().next(),
+        Envelope::Err { error, .. } => return Err(error),
+    };
+    let Some(obj) = obj else {
+        return Ok(None);
+    };
+    if !obj.object_type.eq_ignore_ascii_case(RETENTION_KIND) {
+        return Ok(None);
+    }
+    let parsed: RetentionData = serde_json::from_value(obj.data).map_err(|e| {
+        ErrorEnvelope::new(
+            ErrorCode::ObInvalidSchema,
+            "invalid policy.retention data",
+            Some(serde_json::json!({"object_id": object_id, "error": e.to_string()})),
+        )
+    })?;
+    let immutable_kinds = parsed
+        .immutable_kinds
+        .into_iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+
+    Ok(Some(RetentionPolicy {
+        policy_object_id: object_id,
+        default_ttl_by_kind: normalize_kind_map(parsed.default_ttl_by_kind),
+        max_ttl_by_kind: normalize_kind_map(parsed.max_ttl_by_kind),
+        immutable_kinds,
+    }))
+}
+
+fn parse_rfc3339_utc(input: &str) -> Result<chrono::DateTime<chrono::Utc>, ErrorEnvelope> {
+    chrono::DateTime::parse_from_rfc3339(input)
+        .map(|v| v.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "invalid expires_at timestamp",
+                Some(serde_json::json!({"value": input})),
+            )
+        })
+}
+
+pub fn apply_retention_policy_to_objects(
+    policy: Option<&RetentionPolicy>,
+    objects: &mut [MemoryObject],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ErrorEnvelope> {
+    for obj in objects {
+        let state = obj.lifecycle_state.unwrap_or(LifecycleState::Accepted);
+        let kind = obj
+            .object_type
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let fallback_days = match state {
+            LifecycleState::Scratch => Some(7_i64),
+            LifecycleState::Candidate => Some(30_i64),
+            LifecycleState::Accepted | LifecycleState::Deprecated => None,
+        };
+
+        let policy_default = policy.and_then(|p| p.default_ttl_by_kind.get(&kind).copied());
+        let max_days = policy.and_then(|p| p.max_ttl_by_kind.get(&kind).copied());
+        let immutable = policy
+            .map(|p| p.immutable_kinds.contains(&kind))
+            .unwrap_or(false);
+        let has_explicit = obj
+            .expires_at
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+
+        if has_explicit {
+            let mut expires = parse_rfc3339_utc(obj.expires_at.as_deref().unwrap_or_default())?;
+            if let Some(max) = max_days {
+                let limit = now + chrono::Duration::days(max);
+                if expires > limit {
+                    if immutable {
+                        return Err(deny_error_with_rule(
+                            "OB_POLICY_DENY_RETENTION_IMMUTABLE_KIND",
+                            policy.map(|p| p.policy_object_id.as_str()),
+                            Some(serde_json::json!({"kind": kind, "max_ttl_days": max})),
+                        ));
+                    }
+                    expires = limit;
+                }
+            }
+            obj.expires_at = Some(expires.to_rfc3339());
+            continue;
+        }
+
+        let effective_days = policy_default.or(fallback_days);
+        if let Some(days) = effective_days {
+            let mut expires = now + chrono::Duration::days(days);
+            if let Some(max) = max_days {
+                let limit = now + chrono::Duration::days(max);
+                if expires > limit {
+                    expires = limit;
+                }
+            }
+            obj.expires_at = Some(expires.to_rfc3339());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -485,7 +691,11 @@ mod tests {
             },
         );
         assert!(!decision.allowed);
-        assert_eq!(decision.reason.as_deref(), Some("OB_POLICY_DENY_DECISION"));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("OB_POLICY_DENY_DECISION")
+        );
+        assert_eq!(decision.policy_rule_id.as_deref(), Some("deny"));
     }
 
     #[test]
@@ -503,7 +713,7 @@ mod tests {
         );
         assert!(!decision.allowed);
         assert_eq!(
-            decision.reason.as_deref(),
+            decision.reason_code.as_deref(),
             Some("OB_POLICY_DENY_PROTECTED_KIND")
         );
     }
