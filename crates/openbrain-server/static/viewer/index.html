@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenBrain Viewer</title>
+  <link rel="stylesheet" href="/viewer/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>OpenBrain Viewer</h1>
+    <p class="subtitle">Read-only localhost viewer for governance and memory inspection.</p>
+
+    <section class="panel">
+      <h2>Connection</h2>
+      <div class="grid-2">
+        <label>
+          Base URL
+          <input id="baseUrl" type="text" value="http://127.0.0.1:8080" />
+        </label>
+        <label>
+          Token (Bearer)
+          <input id="token" type="password" placeholder="Paste workspace token" />
+        </label>
+      </div>
+      <label class="inline-check">
+        <input id="allowNonLoopback" type="checkbox" />
+        I understand and want to allow non-loopback base URLs.
+      </label>
+      <div class="row">
+        <button id="saveConn">Save</button>
+        <button id="pingBtn">Ping</button>
+        <span id="pingStatus" class="muted">Not checked</span>
+      </div>
+      <pre id="globalError" class="error hidden"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Workspace</h2>
+      <div class="row">
+        <button id="workspaceBtn">Load Workspace Info</button>
+      </div>
+      <pre id="workspaceOut" class="output"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Audit</h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="object">Object</button>
+        <button class="tab" data-tab="key">Memory Key</button>
+        <button class="tab" data-tab="actor">Actor</button>
+      </div>
+
+      <div class="tab-content active" id="tab-object">
+        <div class="grid-3">
+          <label>Scope <input id="auditObjectScope" type="text" value="ws-default" /></label>
+          <label>Object ID <input id="auditObjectId" type="text" placeholder="obj-123" /></label>
+          <label>Limit <input id="auditObjectLimit" type="number" value="50" min="1" max="200" /></label>
+        </div>
+        <div class="grid-2">
+          <label>From (RFC3339) <input id="auditObjectFrom" type="text" placeholder="2026-01-01T00:00:00Z" /></label>
+          <label>To (RFC3339) <input id="auditObjectTo" type="text" placeholder="2026-01-31T23:59:59Z" /></label>
+        </div>
+        <button id="auditObjectBtn">Run Object Timeline</button>
+      </div>
+
+      <div class="tab-content" id="tab-key">
+        <div class="grid-3">
+          <label>Scope <input id="auditKeyScope" type="text" value="ws-default" /></label>
+          <label>Memory Key <input id="auditKeyValue" type="text" placeholder="decision:db" /></label>
+          <label>Limit <input id="auditKeyLimit" type="number" value="50" min="1" max="200" /></label>
+        </div>
+        <div class="grid-2">
+          <label>From (RFC3339) <input id="auditKeyFrom" type="text" placeholder="2026-01-01T00:00:00Z" /></label>
+          <label>To (RFC3339) <input id="auditKeyTo" type="text" placeholder="2026-01-31T23:59:59Z" /></label>
+        </div>
+        <button id="auditKeyBtn">Run Memory Key Timeline</button>
+      </div>
+
+      <div class="tab-content" id="tab-actor">
+        <div class="grid-3">
+          <label>Scope <input id="auditActorScope" type="text" value="ws-default" /></label>
+          <label>Actor Identity ID <input id="auditActorId" type="text" placeholder="idn-123" /></label>
+          <label>Limit <input id="auditActorLimit" type="number" value="50" min="1" max="200" /></label>
+        </div>
+        <div class="grid-2">
+          <label>From (RFC3339) <input id="auditActorFrom" type="text" placeholder="2026-01-01T00:00:00Z" /></label>
+          <label>To (RFC3339) <input id="auditActorTo" type="text" placeholder="2026-01-31T23:59:59Z" /></label>
+        </div>
+        <button id="auditActorBtn">Run Actor Activity</button>
+      </div>
+
+      <pre id="auditOut" class="output"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Retention</h2>
+      <div class="grid-2">
+        <label>Scope <input id="retentionScope" type="text" value="ws-default" /></label>
+        <div class="row row-end"><button id="retentionBtn">Load Retention Policy</button></div>
+      </div>
+      <pre id="retentionOut" class="output"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Object Inspector</h2>
+      <div class="grid-3">
+        <label>Scope <input id="inspectScope" type="text" value="ws-default" /></label>
+        <label>Object ID <input id="inspectId" type="text" placeholder="obj-123" /></label>
+        <div class="row row-end"><button id="inspectBtn">Inspect</button></div>
+      </div>
+      <pre id="inspectMeta" class="output"></pre>
+      <details>
+        <summary>Show object data (safe JSON preview)</summary>
+        <pre id="inspectData" class="output"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script src="/viewer/app.js"></script>
+</body>
+</html>

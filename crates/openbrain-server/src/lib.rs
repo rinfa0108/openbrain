@@ -2,8 +2,8 @@ use axum::{
     body::Bytes,
     extract::{rejection::BytesRejection, DefaultBodyLimit, State},
     http::HeaderMap,
-    response::IntoResponse,
-    routing::post,
+    response::{Html, IntoResponse},
+    routing::{get, post},
     Json, Router,
 };
 use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope};
@@ -40,6 +40,10 @@ where
     S: Store + AuthStore + Clone + 'static,
 {
     Router::new()
+        .route("/viewer", get(viewer_index))
+        .route("/viewer/", get(viewer_index))
+        .route("/viewer/app.js", get(viewer_app_js))
+        .route("/viewer/styles.css", get(viewer_styles_css))
         .route("/v1/ping", post(ping))
         .route("/v1/write", post(write::<S>))
         .route("/v1/read", post(read::<S>))
@@ -65,6 +69,24 @@ where
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn viewer_index() -> impl IntoResponse {
+    Html(include_str!("../static/viewer/index.html"))
+}
+
+async fn viewer_app_js() -> impl IntoResponse {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        include_str!("../static/viewer/app.js"),
+    )
+}
+
+async fn viewer_styles_css() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("../static/viewer/styles.css"),
+    )
 }
 
 fn err<T>(code: ErrorCode, message: impl Into<String>, details: Option<Value>) -> Envelope<T> {
