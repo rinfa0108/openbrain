@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod governance_cli;
 mod mcp;
 
 use openbrain_embed::{
@@ -46,6 +47,120 @@ enum Command {
         /// Embedding provider selection: "noop" (default), "fake" (dev/testing only), "openai", or "local"
         #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "noop")]
         embed_provider: String,
+    },
+
+    /// Workspace inspection commands
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+
+    /// Audit timeline inspection commands
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+
+    /// Retention policy inspection commands
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// Show workspace ownership and caller role
+    Info {
+        #[arg(
+            long,
+            env = "OPENBRAIN_BASE_URL",
+            default_value = "http://127.0.0.1:7981"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RetentionCommand {
+    /// Show effective policy.retention for a scope
+    Show {
+        #[arg(
+            long,
+            env = "OPENBRAIN_BASE_URL",
+            default_value = "http://127.0.0.1:7981"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+        #[arg(long)]
+        scope: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Timeline of events for a specific object id
+    Object {
+        object_id: String,
+        #[arg(
+            long,
+            env = "OPENBRAIN_BASE_URL",
+            default_value = "http://127.0.0.1:7981"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Timeline of events for a memory key
+    Key {
+        memory_key: String,
+        #[arg(
+            long,
+            env = "OPENBRAIN_BASE_URL",
+            default_value = "http://127.0.0.1:7981"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Timeline of events for an actor identity
+    Actor {
+        actor_identity_id: String,
+        #[arg(
+            long,
+            env = "OPENBRAIN_BASE_URL",
+            default_value = "http://127.0.0.1:7981"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
 }
 
@@ -164,6 +279,182 @@ async fn main() {
                 eprintln!("mcp error: {e}");
                 std::process::exit(1);
             }
+        }
+        Command::Workspace { command } => {
+            if let Err(e) = run_workspace_command(command).await {
+                eprintln!("{}", e.user_message());
+                std::process::exit(1);
+            }
+        }
+        Command::Audit { command } => {
+            if let Err(e) = run_audit_command(command).await {
+                eprintln!("{}", e.user_message());
+                std::process::exit(1);
+            }
+        }
+        Command::Retention { command } => {
+            if let Err(e) = run_retention_command(command).await {
+                eprintln!("{}", e.user_message());
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn run_workspace_command(command: WorkspaceCommand) -> Result<(), governance_cli::CliError> {
+    match command {
+        WorkspaceCommand::Info { base_url, token } => {
+            let transport = governance_cli::ReqwestTransport::new(base_url.clone())?;
+            let args = governance_cli::HttpArgs {
+                token,
+                scope: None,
+                from: None,
+                to: None,
+                limit: None,
+            };
+            let out = governance_cli::run_workspace_info(&transport, &args).await?;
+            print!("{out}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_audit_command(command: AuditCommand) -> Result<(), governance_cli::CliError> {
+    match command {
+        AuditCommand::Object {
+            object_id,
+            base_url,
+            token,
+            scope,
+            from,
+            to,
+            limit,
+        } => {
+            let transport = governance_cli::ReqwestTransport::new(base_url.clone())?;
+            let args = governance_cli::HttpArgs {
+                token,
+                scope: Some(scope),
+                from,
+                to,
+                limit,
+            };
+            let out = governance_cli::run_audit_object(&transport, &args, object_id).await?;
+            print!("{out}");
+        }
+        AuditCommand::Key {
+            memory_key,
+            base_url,
+            token,
+            scope,
+            from,
+            to,
+            limit,
+        } => {
+            let transport = governance_cli::ReqwestTransport::new(base_url.clone())?;
+            let args = governance_cli::HttpArgs {
+                token,
+                scope: Some(scope),
+                from,
+                to,
+                limit,
+            };
+            let out = governance_cli::run_audit_key(&transport, &args, memory_key).await?;
+            print!("{out}");
+        }
+        AuditCommand::Actor {
+            actor_identity_id,
+            base_url,
+            token,
+            scope,
+            from,
+            to,
+            limit,
+        } => {
+            let transport = governance_cli::ReqwestTransport::new(base_url.clone())?;
+            let args = governance_cli::HttpArgs {
+                token,
+                scope: Some(scope),
+                from,
+                to,
+                limit,
+            };
+            let out = governance_cli::run_audit_actor(&transport, &args, actor_identity_id).await?;
+            print!("{out}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_retention_command(command: RetentionCommand) -> Result<(), governance_cli::CliError> {
+    match command {
+        RetentionCommand::Show {
+            base_url,
+            token,
+            scope,
+        } => {
+            let transport = governance_cli::ReqwestTransport::new(base_url.clone())?;
+            let args = governance_cli::HttpArgs {
+                token,
+                scope: Some(scope),
+                from: None,
+                to: None,
+                limit: None,
+            };
+            let out = governance_cli::run_retention_show(&transport, &args).await?;
+            print!("{out}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_workspace_info_command() {
+        let cli = Cli::try_parse_from(["openbrain", "workspace", "info", "--token", "tok"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Workspace {
+                command: WorkspaceCommand::Info { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_audit_object_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "audit",
+            "object",
+            "obj-1",
+            "--token",
+            "tok",
+            "--scope",
+            "ws-default",
+            "--limit",
+            "10",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Command::Audit { command } => match command {
+                AuditCommand::Object {
+                    object_id,
+                    scope,
+                    limit,
+                    ..
+                } => {
+                    assert_eq!(object_id, "obj-1");
+                    assert_eq!(scope, "ws-default");
+                    assert_eq!(limit, Some(10));
+                }
+                _ => panic!("wrong audit command"),
+            },
+            _ => panic!("wrong command"),
         }
     }
 }
