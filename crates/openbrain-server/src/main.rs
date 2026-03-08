@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod embed_cli;
 mod governance_cli;
 mod mcp;
 
@@ -65,6 +66,63 @@ enum Command {
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
+    },
+
+    /// Embedding operator commands
+    Embed {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: Option<String>,
+
+        /// Embedding provider used for generation during re-embed (fake|noop|openai|local)
+        #[arg(long, env = "OPENBRAIN_EMBED_PROVIDER", default_value = "fake")]
+        embed_provider: String,
+
+        #[command(subcommand)]
+        command: EmbedCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmbedCommand {
+    /// Report embedding coverage for a workspace + provider/model/kind
+    Coverage {
+        #[arg(long = "workspace", alias = "scope")]
+        workspace: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "semantic")]
+        kind: String,
+        #[arg(long, value_parser = embed_cli::parse_lifecycle_state, default_value = "accepted")]
+        state: openbrain_core::LifecycleState,
+        #[arg(long, default_value_t = 10)]
+        missing_sample: u32,
+    },
+    /// Re-embed missing objects into target provider/model/kind
+    Reembed {
+        #[arg(long = "workspace", alias = "scope")]
+        workspace: String,
+        #[arg(long = "to-provider")]
+        to_provider: String,
+        #[arg(long = "to-model")]
+        to_model: String,
+        #[arg(long = "to-kind", default_value = "semantic")]
+        to_kind: String,
+        #[arg(long, value_parser = embed_cli::parse_lifecycle_state, default_value = "accepted")]
+        state: openbrain_core::LifecycleState,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        max_objects: Option<u32>,
+        #[arg(long)]
+        actor: Option<String>,
     },
 }
 
@@ -298,6 +356,17 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Embed {
+            database_url,
+            embed_provider,
+            command,
+        } => {
+            let store = connect_store(database_url, embed_provider.clone()).await;
+            if let Err(e) = run_embed_command(&store, &embed_provider, command).await {
+                eprintln!("{}", e.user_message());
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -407,6 +476,93 @@ async fn run_retention_command(command: RetentionCommand) -> Result<(), governan
     Ok(())
 }
 
+#[derive(Debug)]
+enum EmbedCommandError {
+    Usage(String),
+    Api(openbrain_core::ErrorEnvelope),
+}
+
+impl EmbedCommandError {
+    fn user_message(&self) -> String {
+        match self {
+            Self::Usage(msg) => msg.clone(),
+            Self::Api(err) => format!("{}: {}", err.code, err.message),
+        }
+    }
+}
+
+async fn run_embed_command(
+    store: &PgStore,
+    embed_provider: &str,
+    command: EmbedCommand,
+) -> Result<(), EmbedCommandError> {
+    match command {
+        EmbedCommand::Coverage {
+            workspace,
+            provider,
+            model,
+            kind,
+            state,
+            missing_sample,
+        } => {
+            let output = embed_cli::run_embed_coverage(
+                store,
+                openbrain_store::EmbeddingCoverageRequest {
+                    scope: workspace,
+                    provider,
+                    model,
+                    kind,
+                    state,
+                    missing_sample_limit: Some(missing_sample),
+                },
+            )
+            .await
+            .map_err(EmbedCommandError::Api)?;
+            print!("{output}");
+        }
+        EmbedCommand::Reembed {
+            workspace,
+            to_provider,
+            to_model,
+            to_kind,
+            state,
+            limit,
+            cursor,
+            dry_run,
+            max_bytes,
+            max_objects,
+            actor,
+        } => {
+            if !to_provider.eq_ignore_ascii_case(embed_provider) {
+                return Err(EmbedCommandError::Usage(format!(
+                    "--to-provider ({to_provider}) must match --embed-provider ({embed_provider}) for deterministic re-embed execution"
+                )));
+            }
+
+            let output = embed_cli::run_embed_reembed(
+                store,
+                openbrain_store::EmbeddingReembedRequest {
+                    scope: workspace,
+                    to_provider,
+                    to_model,
+                    to_kind,
+                    state,
+                    limit: Some(limit),
+                    after: cursor,
+                    dry_run,
+                    max_bytes,
+                    max_objects,
+                    actor,
+                },
+            )
+            .await
+            .map_err(EmbedCommandError::Api)?;
+            print!("{output}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +612,58 @@ mod tests {
             },
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn parses_embed_coverage_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "embed",
+            "coverage",
+            "--workspace",
+            "ws-default",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-v1",
+        ])
+        .expect("parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Embed {
+                command: EmbedCommand::Coverage { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_embed_reembed_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "embed",
+            "--embed-provider",
+            "fake",
+            "reembed",
+            "--workspace",
+            "ws-default",
+            "--to-provider",
+            "fake",
+            "--to-model",
+            "fake-v1",
+            "--limit",
+            "25",
+            "--dry-run",
+        ])
+        .expect("parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Embed {
+                command: EmbedCommand::Reembed { .. },
+                ..
+            }
+        ));
     }
 }

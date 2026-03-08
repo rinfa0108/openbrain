@@ -192,6 +192,56 @@ pub struct EmbedGenerateResponse {
     pub reused: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingCoverageRequest {
+    pub scope: String,
+    pub provider: String,
+    pub model: String,
+    pub kind: String,
+    pub state: LifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_sample_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingCoverageResponse {
+    pub total_eligible: u64,
+    pub with_embeddings: u64,
+    pub missing: u64,
+    pub percent_coverage: f64,
+    pub missing_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingReembedRequest {
+    pub scope: String,
+    pub to_provider: String,
+    pub to_model: String,
+    pub to_kind: String,
+    pub state: LifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_objects: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingReembedResponse {
+    pub scanned: u32,
+    pub processed: u32,
+    pub next_cursor: Option<String>,
+    pub dry_run: bool,
+    pub bytes_processed: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {

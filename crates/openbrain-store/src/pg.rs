@@ -17,11 +17,12 @@ use uuid::Uuid;
 use crate::{
     AuditActorActivityRequest, AuditEvent, AuditMemoryKeyTimelineRequest,
     AuditObjectTimelineRequest, AuditResponse, AuthContext, AuthStore, BootstrapToken,
-    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
-    GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
-    SearchMatch, SearchSemanticRequest, SearchSemanticResponse, SearchStructuredRequest,
-    SearchStructuredResponse, Store, TokenCreateRequest, TokenCreateResponse,
-    WorkspaceInfoResponse, WorkspaceRole,
+    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, EmbeddingCoverageRequest,
+    EmbeddingCoverageResponse, EmbeddingReembedRequest, EmbeddingReembedResponse,
+    GetObjectsRequest, GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse,
+    PutResult, SearchItem, SearchMatch, SearchSemanticRequest, SearchSemanticResponse,
+    SearchStructuredRequest, SearchStructuredResponse, Store, TokenCreateRequest,
+    TokenCreateResponse, WorkspaceInfoResponse, WorkspaceRole,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -35,6 +36,9 @@ const DEFAULT_EMBED_KIND: &str = "semantic";
 const DEFAULT_EMBED_MODEL: &str = "default";
 const DEFAULT_WORKSPACE_ID: &str = "default";
 const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
+const DEFAULT_REEMBED_LIMIT: u32 = 100;
+const MAX_REEMBED_LIMIT: u32 = 500;
+const MAX_REEMBED_MISSING_SAMPLE: u32 = 25;
 
 fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
     let mut out = String::with_capacity(embedding.len() * 12 + 2);
@@ -143,6 +147,329 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn embedding_coverage(
+        &self,
+        req: EmbeddingCoverageRequest,
+    ) -> Result<EmbeddingCoverageResponse, ErrorEnvelope> {
+        let scope = req.scope.trim();
+        if scope.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObScopeRequired,
+                "scope is required",
+                None,
+            ));
+        }
+        let provider = req.provider.trim();
+        let model = req.model.trim();
+        let kind = req.kind.trim();
+        if provider.is_empty() || model.is_empty() || kind.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "provider, model, and kind are required",
+                None,
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        let state = req.state.as_str();
+        let sample_limit = req
+            .missing_sample_limit
+            .unwrap_or(10)
+            .min(MAX_REEMBED_MISSING_SAMPLE);
+
+        let total_eligible: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM ob_objects o
+               WHERE o.scope = $1
+                 AND o.lifecycle_state = $2
+                 AND (o.expires_at IS NULL OR o.expires_at > $3)"#,
+        )
+        .bind(scope)
+        .bind(state)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("coverage total query failed: {e}"),
+                None,
+            )
+        })?;
+
+        let with_embeddings: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM ob_objects o
+               WHERE o.scope = $1
+                 AND o.lifecycle_state = $2
+                 AND (o.expires_at IS NULL OR o.expires_at > $3)
+                 AND EXISTS (
+                   SELECT 1 FROM ob_embeddings e
+                   WHERE e.scope = o.scope
+                     AND e.object_id = o.id
+                     AND e.provider = $4
+                     AND e.model = $5
+                     AND e.kind = $6
+                 )"#,
+        )
+        .bind(scope)
+        .bind(state)
+        .bind(now)
+        .bind(provider)
+        .bind(model)
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("coverage query failed: {e}"),
+                None,
+            )
+        })?;
+
+        let missing_refs: Vec<String> = sqlx::query_scalar(
+            r#"SELECT o.id
+               FROM ob_objects o
+               WHERE o.scope = $1
+                 AND o.lifecycle_state = $2
+                 AND (o.expires_at IS NULL OR o.expires_at > $3)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ob_embeddings e
+                   WHERE e.scope = o.scope
+                     AND e.object_id = o.id
+                     AND e.provider = $4
+                     AND e.model = $5
+                     AND e.kind = $6
+                 )
+               ORDER BY o.id ASC
+               LIMIT $7"#,
+        )
+        .bind(scope)
+        .bind(state)
+        .bind(now)
+        .bind(provider)
+        .bind(model)
+        .bind(kind)
+        .bind(sample_limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("coverage missing sample query failed: {e}"),
+                None,
+            )
+        })?;
+
+        let total_eligible_u = total_eligible.max(0) as u64;
+        let with_embeddings_u = with_embeddings.max(0) as u64;
+        let missing = total_eligible_u.saturating_sub(with_embeddings_u);
+        let percent_coverage = if total_eligible_u == 0 {
+            100.0
+        } else {
+            (with_embeddings_u as f64 * 100.0) / total_eligible_u as f64
+        };
+
+        Ok(EmbeddingCoverageResponse {
+            total_eligible: total_eligible_u,
+            with_embeddings: with_embeddings_u,
+            missing,
+            percent_coverage,
+            missing_refs,
+        })
+    }
+
+    pub async fn reembed_missing(
+        &self,
+        req: EmbeddingReembedRequest,
+    ) -> Result<EmbeddingReembedResponse, ErrorEnvelope> {
+        let scope = req.scope.trim();
+        if scope.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObScopeRequired,
+                "scope is required",
+                None,
+            ));
+        }
+
+        let provider = req.to_provider.trim();
+        let model = req.to_model.trim();
+        let kind = req.to_kind.trim();
+        if provider.is_empty() || model.is_empty() || kind.is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "to_provider, to_model, and to_kind are required",
+                None,
+            ));
+        }
+
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_REEMBED_LIMIT)
+            .clamp(1, MAX_REEMBED_LIMIT);
+        let max_objects = req.max_objects.unwrap_or(limit).clamp(1, limit);
+        let max_bytes = req.max_bytes.unwrap_or(u64::MAX);
+        let now = chrono::Utc::now();
+
+        #[derive(sqlx::FromRow)]
+        struct CandidateRow {
+            id: String,
+            r#type: String,
+            data: sqlx::types::Json<Value>,
+        }
+
+        let rows: Vec<CandidateRow> = sqlx::query_as(
+            r#"SELECT o.id, o.type, o.data
+               FROM ob_objects o
+               WHERE o.scope = $1
+                 AND o.lifecycle_state = $2
+                 AND (o.expires_at IS NULL OR o.expires_at > $3)
+                 AND ($4::text IS NULL OR o.id > $4)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ob_embeddings e
+                   WHERE e.scope = o.scope
+                     AND e.object_id = o.id
+                     AND e.provider = $5
+                     AND e.model = $6
+                     AND e.kind = $7
+                 )
+               ORDER BY o.id ASC
+               LIMIT $8"#,
+        )
+        .bind(scope)
+        .bind(req.state.as_str())
+        .bind(now)
+        .bind(req.after.as_deref())
+        .bind(provider)
+        .bind(model)
+        .bind(kind)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("reembed candidate query failed: {e}"),
+                None,
+            )
+        })?;
+
+        let scanned = rows.len() as u32;
+        let mut processed: u32 = 0;
+        let mut bytes_processed: u64 = 0;
+        let mut last_processed_id: Option<String> = None;
+
+        for row in rows {
+            if processed >= max_objects {
+                break;
+            }
+
+            let normalized = normalize_object_text(&row.r#type, &row.data.0)?;
+            let normalized = validate_embedding_text(&normalized, MAX_EMBED_TEXT_LEN)?;
+            let text_bytes = normalized.len() as u64;
+            if bytes_processed.saturating_add(text_bytes) > max_bytes {
+                break;
+            }
+
+            if !req.dry_run {
+                let checksum = checksum_v01(&normalized);
+                let embedding = self.embedder.embed(model, &normalized).await.map_err(|e| {
+                    let (code, message, details) = match e {
+                        EmbedError::ProviderUnavailable => (
+                            ErrorCode::ObEmbeddingFailed,
+                            "embedding provider unavailable".to_string(),
+                            Some(serde_json::json!({"reason": "provider_unavailable"})),
+                        ),
+                        EmbedError::InvalidInput(m) => (ErrorCode::ObEmbeddingFailed, m, None),
+                        EmbedError::InvalidRequest {
+                            message, details, ..
+                        } => (ErrorCode::ObInvalidRequest, message, details),
+                        EmbedError::ProviderError {
+                            message, details, ..
+                        } => (ErrorCode::ObEmbeddingFailed, message, details),
+                    };
+                    ErrorEnvelope::new(code, message, details)
+                })?;
+
+                let got_dims = embedding.len() as i32;
+                if got_dims != EMBEDDING_DIMS {
+                    return Err(ErrorEnvelope::new(
+                        ErrorCode::ObEmbeddingFailed,
+                        "provider returned wrong embedding dims",
+                        Some(serde_json::json!({"expected": EMBEDDING_DIMS, "got": got_dims})),
+                    ));
+                }
+                let vector_text = embedding_to_pgvector_literal(&embedding)?;
+                let embedding_id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    r#"INSERT INTO ob_embeddings
+                       (id, object_id, scope, provider, model, kind, dims, checksum, embedding)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ($9)::vector)
+                       ON CONFLICT (scope, object_id, provider, model, kind)
+                       WHERE object_id IS NOT NULL
+                       DO UPDATE SET
+                         checksum = EXCLUDED.checksum,
+                         dims = EXCLUDED.dims,
+                         embedding = EXCLUDED.embedding,
+                         created_at = now()"#,
+                )
+                .bind(&embedding_id)
+                .bind(&row.id)
+                .bind(scope)
+                .bind(provider)
+                .bind(model)
+                .bind(kind)
+                .bind(EMBEDDING_DIMS)
+                .bind(checksum)
+                .bind(vector_text)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("failed to upsert embedding: {e}"),
+                        None,
+                    )
+                })?;
+            }
+
+            processed += 1;
+            bytes_processed = bytes_processed.saturating_add(text_bytes);
+            last_processed_id = Some(row.id);
+        }
+
+        if !req.dry_run && processed > 0 {
+            let actor = req
+                .actor
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("system.reembed");
+            self.append_event(
+                scope,
+                "embed.reembed.batch",
+                actor,
+                serde_json::json!({
+                    "scope": scope,
+                    "provider": provider,
+                    "model": model,
+                    "kind": kind,
+                    "processed": processed,
+                    "bytes_processed": bytes_processed,
+                }),
+            )
+            .await;
+        }
+
+        Ok(EmbeddingReembedResponse {
+            scanned,
+            processed,
+            next_cursor: last_processed_id,
+            dry_run: req.dry_run,
+            bytes_processed,
+        })
     }
 
     fn normalize_opt_field(value: Option<&str>) -> Option<String> {
