@@ -28,7 +28,7 @@ Output includes:
 ## Dry-run re-embed
 
 ```powershell
-openbrain embed --embed-provider fake reembed `
+openbrain embed --token $env:OPENBRAIN_TOKEN reembed `
   --workspace default `
   --to-provider fake `
   --to-model fake-v1 `
@@ -44,7 +44,7 @@ openbrain embed --embed-provider fake reembed `
 ## Execute re-embed (bounded + resumable)
 
 ```powershell
-openbrain embed --embed-provider fake reembed `
+openbrain embed --token $env:OPENBRAIN_TOKEN reembed `
   --workspace default `
   --to-provider fake `
   --to-model fake-v1 `
@@ -58,7 +58,7 @@ openbrain embed --embed-provider fake reembed `
 Use the returned `next_cursor` to resume:
 
 ```powershell
-openbrain embed --embed-provider fake reembed `
+openbrain embed --token $env:OPENBRAIN_TOKEN reembed `
   --workspace default `
   --to-provider fake `
   --to-model fake-v1 `
@@ -75,4 +75,4 @@ openbrain embed --embed-provider fake reembed `
 4. Run bounded real batches until coverage reaches target.
 5. Re-run semantic search with the target embedding selector.
 
-For deterministic local runs, use `--embed-provider fake` and keep live providers disabled unless explicitly needed.
+For deterministic local runs, use `--to-provider fake` and keep live providers disabled unless explicitly needed.
