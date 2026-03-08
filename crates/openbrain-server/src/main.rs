@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod embed_cli;
 mod governance_cli;
 mod mcp;
 
@@ -8,7 +9,7 @@ use openbrain_embed::{
     OpenAIEmbeddingProvider,
 };
 use openbrain_llm::AnthropicClient;
-use openbrain_server::{build_router, AppState};
+use openbrain_server::{build_router, policy, AppState};
 use openbrain_store::{AuthStore, PgStore};
 use std::{net::SocketAddr, sync::Arc};
 use tracing::{info, warn};
@@ -65,6 +66,63 @@ enum Command {
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
+    },
+
+    /// Embedding operator commands
+    Embed {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: Option<String>,
+
+        /// Auth token for workspace-scoped coverage/re-embed authorization checks
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: String,
+
+        #[command(subcommand)]
+        command: EmbedCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmbedCommand {
+    /// Report embedding coverage for a workspace + provider/model/kind
+    Coverage {
+        #[arg(long = "workspace", alias = "scope")]
+        workspace: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "semantic")]
+        kind: String,
+        #[arg(long, value_parser = embed_cli::parse_lifecycle_state, default_value = "accepted")]
+        state: openbrain_core::LifecycleState,
+        #[arg(long, default_value_t = 10)]
+        missing_sample: u32,
+    },
+    /// Re-embed missing objects into target provider/model/kind
+    Reembed {
+        #[arg(long = "workspace", alias = "scope")]
+        workspace: String,
+        #[arg(long = "to-provider")]
+        to_provider: String,
+        #[arg(long = "to-model")]
+        to_model: String,
+        #[arg(long = "to-kind", default_value = "semantic")]
+        to_kind: String,
+        #[arg(long, value_parser = embed_cli::parse_lifecycle_state, default_value = "accepted")]
+        state: openbrain_core::LifecycleState,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        max_objects: Option<u32>,
+        #[arg(long)]
+        actor: Option<String>,
     },
 }
 
@@ -298,6 +356,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Embed {
+            database_url,
+            token,
+            command,
+        } => {
+            let selected_provider = match &command {
+                EmbedCommand::Reembed { to_provider, .. } => to_provider.clone(),
+                EmbedCommand::Coverage { .. } => "noop".to_string(),
+            };
+            let store = connect_store(database_url, selected_provider).await;
+            if let Err(e) = run_embed_command(&store, &token, command).await {
+                eprintln!("{}", e.user_message());
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -407,6 +480,184 @@ async fn run_retention_command(command: RetentionCommand) -> Result<(), governan
     Ok(())
 }
 
+#[derive(Debug)]
+enum EmbedCommandError {
+    Api(openbrain_core::ErrorEnvelope),
+}
+
+impl EmbedCommandError {
+    fn user_message(&self) -> String {
+        match self {
+            Self::Api(err) => format!("{}: {}", err.code, err.message),
+        }
+    }
+}
+
+async fn run_embed_command(
+    store: &PgStore,
+    token: &str,
+    command: EmbedCommand,
+) -> Result<(), EmbedCommandError> {
+    match command {
+        EmbedCommand::Coverage {
+            workspace,
+            provider,
+            model,
+            kind,
+            state,
+            missing_sample,
+        } => {
+            let auth = store
+                .auth_from_token(token)
+                .await
+                .map_err(EmbedCommandError::Api)?;
+            if auth.workspace_id != workspace {
+                return Err(EmbedCommandError::Api(openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObForbidden,
+                    "token does not grant access to requested workspace",
+                    None,
+                )));
+            }
+            if !auth.role.can_read() {
+                return Err(EmbedCommandError::Api(openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObForbidden,
+                    "coverage requires read permission",
+                    None,
+                )));
+            }
+            let output = embed_cli::run_embed_coverage(
+                store,
+                openbrain_store::EmbeddingCoverageRequest {
+                    scope: workspace,
+                    provider,
+                    model,
+                    kind,
+                    state,
+                    missing_sample_limit: Some(missing_sample),
+                },
+            )
+            .await
+            .map_err(EmbedCommandError::Api)?;
+            print!("{output}");
+        }
+        EmbedCommand::Reembed {
+            workspace,
+            to_provider,
+            to_model,
+            to_kind,
+            state,
+            limit,
+            cursor,
+            dry_run,
+            max_bytes,
+            max_objects,
+            actor,
+        } => {
+            let auth = store
+                .auth_from_token(token)
+                .await
+                .map_err(EmbedCommandError::Api)?;
+            if auth.workspace_id != workspace {
+                return Err(EmbedCommandError::Api(openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObForbidden,
+                    "token does not grant access to requested workspace",
+                    None,
+                )));
+            }
+            if !auth.role.can_write() {
+                return Err(EmbedCommandError::Api(openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObForbidden,
+                    "re-embed requires writer or owner role",
+                    None,
+                )));
+            }
+
+            // Preflight policy check to avoid bypassing kind-based embed restrictions in CLI path.
+            let rules = policy::load_workspace_policies(store, &workspace)
+                .await
+                .map_err(EmbedCommandError::Api)?;
+            let scope_for_query = workspace.as_str();
+            let now = chrono::Utc::now();
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                r#"SELECT DISTINCT o.type, o.memory_key
+                   FROM ob_objects o
+                   WHERE o.scope = $1
+                     AND o.lifecycle_state = $2
+                     AND (o.expires_at IS NULL OR o.expires_at > $3)
+                     AND ($4::text IS NULL OR o.id > $4)
+                     AND NOT EXISTS (
+                       SELECT 1 FROM ob_embeddings e
+                       WHERE e.scope = o.scope
+                         AND e.object_id = o.id
+                         AND e.provider = $5
+                         AND e.model = $6
+                         AND e.kind = $7
+                     )
+                   ORDER BY o.type ASC
+                   LIMIT $8"#,
+            )
+            .bind(scope_for_query)
+            .bind(state.as_str())
+            .bind(now)
+            .bind(cursor.as_deref())
+            .bind(to_provider.as_str())
+            .bind(to_model.as_str())
+            .bind(to_kind.as_str())
+            .bind(limit as i64)
+            .fetch_all(store.pool())
+            .await
+            .map_err(|e| {
+                EmbedCommandError::Api(openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObStorageError,
+                    format!("re-embed policy preflight query failed: {e}"),
+                    None,
+                ))
+            })?;
+
+            for (object_kind, memory_key) in rows {
+                let decision = policy::evaluate(
+                    &rules,
+                    &policy::EvalInput {
+                        role: auth.role,
+                        identity_id: &auth.identity_id,
+                        operation: policy::PolicyOperation::EmbedGenerate,
+                        object_kind: Some(object_kind.as_str()),
+                        memory_key: memory_key.as_deref(),
+                        lifecycle_transition: None,
+                    },
+                );
+                if !decision.allowed {
+                    return Err(EmbedCommandError::Api(policy::deny_error_with_rule(
+                        decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                        decision.policy_rule_id.as_deref(),
+                    )));
+                }
+            }
+
+            let output = embed_cli::run_embed_reembed(
+                store,
+                openbrain_store::EmbeddingReembedRequest {
+                    scope: workspace,
+                    to_provider,
+                    to_model,
+                    to_kind,
+                    state,
+                    limit: Some(limit),
+                    after: cursor,
+                    dry_run,
+                    max_bytes,
+                    max_objects,
+                    actor,
+                },
+            )
+            .await
+            .map_err(EmbedCommandError::Api)?;
+            print!("{output}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +707,60 @@ mod tests {
             },
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn parses_embed_coverage_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "embed",
+            "--token",
+            "ob_demo",
+            "coverage",
+            "--workspace",
+            "ws-default",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-v1",
+        ])
+        .expect("parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Embed {
+                command: EmbedCommand::Coverage { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_embed_reembed_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "embed",
+            "--token",
+            "ob_demo",
+            "reembed",
+            "--workspace",
+            "ws-default",
+            "--to-provider",
+            "fake",
+            "--to-model",
+            "fake-v1",
+            "--limit",
+            "25",
+            "--dry-run",
+        ])
+        .expect("parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Embed {
+                command: EmbedCommand::Reembed { .. },
+                ..
+            }
+        ));
     }
 }
