@@ -620,3 +620,97 @@ fn mcp_policy_denies_reader_decision_read() {
     let _ = reader_child.kill();
     let _ = reader_child.wait();
 }
+
+#[test]
+fn mcp_audit_object_timeline_parity() {
+    let Some(pool) = setup_pool() else {
+        return;
+    };
+    let (token, workspace_id) = create_workspace_token(&pool, "owner");
+    let obj_id = format!("obj-{}", uuid::Uuid::new_v4());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openbrain"))
+        .arg("mcp")
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("db url"),
+        )
+        .env("OPENBRAIN_EMBED_PROVIDER", "noop")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openbrain mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"0","auth_token": token}
+        })
+    )
+    .expect("write initialize");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"openbrain.write","arguments":{"objects":[
+                {"type":"claim","id":obj_id,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"k":"v"},"provenance":{"actor":"owner"}}
+            ]}}
+        })
+    )
+    .expect("write object");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{"name":"openbrain.audit.object_timeline","arguments":{"scope":workspace_id,"object_id":obj_id,"limit":20}}
+        })
+    )
+    .expect("write audit call");
+
+    drop(stdin);
+
+    let reader = BufReader::new(stdout);
+    let mut saw_audit_ok = false;
+    for line in reader.lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).expect("stdout JSON");
+        if v.get("id").and_then(|id| id.as_i64()) == Some(3) {
+            let ok = v
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|b| b.as_bool());
+            let events = v
+                .get("result")
+                .and_then(|r| r.get("events"))
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(ok, Some(true));
+            assert!(
+                !events.is_empty(),
+                "audit timeline should include object events"
+            );
+            saw_audit_ok = true;
+            break;
+        }
+    }
+
+    assert!(saw_audit_ok);
+    let _ = child.kill();
+    let _ = child.wait();
+}

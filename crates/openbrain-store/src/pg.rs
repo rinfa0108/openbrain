@@ -15,15 +15,18 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    AuthContext, AuthStore, BootstrapToken, EmbedGenerateRequest, EmbedGenerateResponse,
-    EmbedTarget, GetObjectsRequest, GetObjectsResponse, OrderBySpec, PutObjectsRequest,
-    PutObjectsResponse, PutResult, SearchItem, SearchMatch, SearchSemanticRequest,
-    SearchSemanticResponse, SearchStructuredRequest, SearchStructuredResponse, Store,
-    TokenCreateRequest, TokenCreateResponse, WorkspaceRole,
+    AuditActorActivityRequest, AuditEvent, AuditMemoryKeyTimelineRequest,
+    AuditObjectTimelineRequest, AuditResponse, AuthContext, AuthStore, BootstrapToken,
+    EmbedGenerateRequest, EmbedGenerateResponse, EmbedTarget, GetObjectsRequest,
+    GetObjectsResponse, OrderBySpec, PutObjectsRequest, PutObjectsResponse, PutResult, SearchItem,
+    SearchMatch, SearchSemanticRequest, SearchSemanticResponse, SearchStructuredRequest,
+    SearchStructuredResponse, Store, TokenCreateRequest, TokenCreateResponse,
+    WorkspaceInfoResponse, WorkspaceRole,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
+const MAX_AUDIT_LIMIT: u32 = 200;
 
 const EMBEDDING_DIMS: i32 = 1536;
 const MAX_EMBED_TEXT_LEN: usize = 32 * 1024;
@@ -388,6 +391,47 @@ impl PgStore {
         .await?;
         Ok(())
     }
+
+    fn parse_audit_ts(
+        label: &str,
+        value: Option<&str>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ErrorEnvelope> {
+        Self::parse_datetime_opt(label, value)
+    }
+
+    fn event_summary(event_type: &str, payload: &Value) -> Option<String> {
+        let object_id = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+        if object_id.is_empty() {
+            return Some(event_type.to_string());
+        }
+        Some(format!("{event_type}:{object_id}"))
+    }
+
+    fn audit_event_from_row(
+        id: i64,
+        event_type: String,
+        actor: String,
+        payload: Value,
+        ts: chrono::DateTime<chrono::Utc>,
+        memory_key: Option<String>,
+    ) -> AuditEvent {
+        let object_id = payload
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let object_version = payload.get("version").and_then(|v| v.as_i64());
+        let summary = Self::event_summary(&event_type, &payload);
+        AuditEvent {
+            id,
+            event_type,
+            actor_identity_id: actor,
+            object_id,
+            object_version,
+            memory_key,
+            ts: ts.to_rfc3339(),
+            summary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +463,13 @@ fn default_expiry_for_state(
         LifecycleState::Candidate => Some(now + chrono::Duration::days(30)),
         LifecycleState::Accepted | LifecycleState::Deprecated => None,
     }
+}
+
+fn parse_audit_limit_offset(limit: Option<u32>, offset: Option<u32>) -> (u32, u32) {
+    (
+        limit.unwrap_or(DEFAULT_LIMIT).min(MAX_AUDIT_LIMIT),
+        offset.unwrap_or(0),
+    )
 }
 
 fn field_to_sql(field: &FieldPath) -> Result<(String, FieldType), ErrorEnvelope> {
@@ -1881,6 +1932,225 @@ impl Store for PgStore {
         .execute(&self.pool)
         .await;
     }
+
+    async fn audit_object_timeline(
+        &self,
+        req: AuditObjectTimelineRequest,
+    ) -> Envelope<AuditResponse> {
+        if req.query.scope.trim().is_empty() || req.object_id.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "scope and object_id are required",
+                None,
+            ));
+        }
+        let from = match Self::parse_audit_ts("from", req.query.from.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let to = match Self::parse_audit_ts("to", req.query.to.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let (limit, offset) = parse_audit_limit_offset(req.query.limit, req.query.offset);
+
+        let rows = match sqlx::query(
+            r#"SELECT e.id, e.event_type, e.actor, e.payload, e.ts, o.memory_key
+               FROM ob_events e
+               LEFT JOIN ob_objects o
+                 ON o.scope = e.scope
+                AND o.id = (e.payload ->> 'ref')
+               WHERE e.scope = $1
+                 AND (e.payload ->> 'ref') = $2
+                 AND ($3::timestamptz IS NULL OR e.ts >= $3)
+                 AND ($4::timestamptz IS NULL OR e.ts <= $4)
+               ORDER BY e.ts DESC, e.id DESC
+               LIMIT $5 OFFSET $6"#,
+        )
+        .bind(&req.query.scope)
+        .bind(req.object_id.trim())
+        .bind(from)
+        .bind(to)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("audit object timeline failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let events = rows
+            .into_iter()
+            .map(|r| {
+                Self::audit_event_from_row(
+                    r.get("id"),
+                    r.get("event_type"),
+                    r.get("actor"),
+                    r.get::<sqlx::types::Json<Value>, _>("payload").0,
+                    r.get("ts"),
+                    r.get("memory_key"),
+                )
+            })
+            .collect();
+        Envelope::ok(AuditResponse {
+            events,
+            limit,
+            offset,
+        })
+    }
+
+    async fn audit_memory_key_timeline(
+        &self,
+        req: AuditMemoryKeyTimelineRequest,
+    ) -> Envelope<AuditResponse> {
+        if req.query.scope.trim().is_empty() || req.memory_key.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "scope and memory_key are required",
+                None,
+            ));
+        }
+        let from = match Self::parse_audit_ts("from", req.query.from.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let to = match Self::parse_audit_ts("to", req.query.to.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let (limit, offset) = parse_audit_limit_offset(req.query.limit, req.query.offset);
+
+        let rows = match sqlx::query(
+            r#"SELECT e.id, e.event_type, e.actor, e.payload, e.ts, o.memory_key
+               FROM ob_events e
+               JOIN ob_objects o
+                 ON o.scope = e.scope
+                AND o.id = (e.payload ->> 'ref')
+               WHERE e.scope = $1
+                 AND o.memory_key = $2
+                 AND ($3::timestamptz IS NULL OR e.ts >= $3)
+                 AND ($4::timestamptz IS NULL OR e.ts <= $4)
+               ORDER BY e.ts DESC, e.id DESC
+               LIMIT $5 OFFSET $6"#,
+        )
+        .bind(&req.query.scope)
+        .bind(req.memory_key.trim())
+        .bind(from)
+        .bind(to)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("audit memory_key timeline failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let events = rows
+            .into_iter()
+            .map(|r| {
+                Self::audit_event_from_row(
+                    r.get("id"),
+                    r.get("event_type"),
+                    r.get("actor"),
+                    r.get::<sqlx::types::Json<Value>, _>("payload").0,
+                    r.get("ts"),
+                    r.get("memory_key"),
+                )
+            })
+            .collect();
+        Envelope::ok(AuditResponse {
+            events,
+            limit,
+            offset,
+        })
+    }
+
+    async fn audit_actor_activity(
+        &self,
+        req: AuditActorActivityRequest,
+    ) -> Envelope<AuditResponse> {
+        if req.query.scope.trim().is_empty() || req.actor_identity_id.trim().is_empty() {
+            return Envelope::err(ErrorEnvelope::new(
+                ErrorCode::ObInvalidRequest,
+                "scope and actor_identity_id are required",
+                None,
+            ));
+        }
+        let from = match Self::parse_audit_ts("from", req.query.from.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let to = match Self::parse_audit_ts("to", req.query.to.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Envelope::err(e),
+        };
+        let (limit, offset) = parse_audit_limit_offset(req.query.limit, req.query.offset);
+
+        let rows = match sqlx::query(
+            r#"SELECT e.id, e.event_type, e.actor, e.payload, e.ts, o.memory_key
+               FROM ob_events e
+               LEFT JOIN ob_objects o
+                 ON o.scope = e.scope
+                AND o.id = (e.payload ->> 'ref')
+               WHERE e.scope = $1
+                 AND e.actor = $2
+                 AND ($3::timestamptz IS NULL OR e.ts >= $3)
+                 AND ($4::timestamptz IS NULL OR e.ts <= $4)
+               ORDER BY e.ts DESC, e.id DESC
+               LIMIT $5 OFFSET $6"#,
+        )
+        .bind(&req.query.scope)
+        .bind(req.actor_identity_id.trim())
+        .bind(from)
+        .bind(to)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("audit actor activity failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let events = rows
+            .into_iter()
+            .map(|r| {
+                Self::audit_event_from_row(
+                    r.get("id"),
+                    r.get("event_type"),
+                    r.get("actor"),
+                    r.get::<sqlx::types::Json<Value>, _>("payload").0,
+                    r.get("ts"),
+                    r.get("memory_key"),
+                )
+            })
+            .collect();
+        Envelope::ok(AuditResponse {
+            events,
+            limit,
+            offset,
+        })
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2168,5 +2438,55 @@ impl AuthStore for PgStore {
             workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
             role: WorkspaceRole::Owner,
         }))
+    }
+
+    async fn workspace_info(
+        &self,
+        workspace_id: &str,
+        caller_identity_id: &str,
+        caller_role: WorkspaceRole,
+    ) -> Result<WorkspaceInfoResponse, ErrorEnvelope> {
+        #[derive(sqlx::FromRow)]
+        struct OwnerRow {
+            identity_id: String,
+            display_name: Option<String>,
+        }
+
+        let row: Option<OwnerRow> = sqlx::query_as(
+            r#"SELECT t.identity_id, i.display_name
+               FROM ob_tokens t
+               LEFT JOIN ob_identities i ON i.id = t.identity_id
+               WHERE t.workspace_id = $1
+                 AND t.role = 'owner'
+                 AND t.revoked_at IS NULL
+               ORDER BY t.created_at ASC
+               LIMIT 1"#,
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("workspace info lookup failed: {e}"),
+                None,
+            )
+        })?;
+
+        let Some(owner) = row else {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ObNotFound,
+                "workspace owner not found",
+                Some(serde_json::json!({"workspace_id": workspace_id})),
+            ));
+        };
+
+        Ok(WorkspaceInfoResponse {
+            workspace_id: workspace_id.to_string(),
+            owner_identity_id: owner.identity_id,
+            owner_display_name: owner.display_name,
+            caller_identity_id: caller_identity_id.to_string(),
+            caller_role,
+        })
     }
 }

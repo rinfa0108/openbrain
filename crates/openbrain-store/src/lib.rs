@@ -262,6 +262,73 @@ pub struct TokenCreateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceInfoResponse {
+    pub workspace_id: String,
+    pub owner_identity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_display_name: Option<String>,
+    pub caller_identity_id: String,
+    pub caller_role: WorkspaceRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRequest {
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditObjectTimelineRequest {
+    #[serde(flatten)]
+    pub query: AuditRequest,
+    pub object_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditMemoryKeyTimelineRequest {
+    #[serde(flatten)]
+    pub query: AuditRequest,
+    pub memory_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditActorActivityRequest {
+    #[serde(flatten)]
+    pub query: AuditRequest,
+    pub actor_identity_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub actor_identity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_key: Option<String>,
+    pub ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditResponse {
+    pub events: Vec<AuditEvent>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapToken {
     pub token: String,
     pub workspace_id: String,
@@ -291,6 +358,19 @@ pub trait Store: Send + Sync {
         actor: &str,
         payload_json: Value,
     ) -> ();
+
+    async fn audit_object_timeline(
+        &self,
+        req: AuditObjectTimelineRequest,
+    ) -> Envelope<AuditResponse>;
+
+    async fn audit_memory_key_timeline(
+        &self,
+        req: AuditMemoryKeyTimelineRequest,
+    ) -> Envelope<AuditResponse>;
+
+    async fn audit_actor_activity(&self, req: AuditActorActivityRequest)
+        -> Envelope<AuditResponse>;
 }
 
 #[async_trait]
@@ -308,6 +388,13 @@ pub trait AuthStore: Send + Sync {
     async fn bootstrap_default_workspace(
         &self,
     ) -> Result<Option<BootstrapToken>, openbrain_core::ErrorEnvelope>;
+
+    async fn workspace_info(
+        &self,
+        workspace_id: &str,
+        caller_identity_id: &str,
+        caller_role: WorkspaceRole,
+    ) -> Result<WorkspaceInfoResponse, openbrain_core::ErrorEnvelope>;
 }
 
 #[cfg(test)]
