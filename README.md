@@ -11,337 +11,139 @@ It stores **typed, versioned memory objects** (claims, decisions, tasks, artifac
 
 ---
 
-## Current status (implemented in main)
+## Why OpenBrain exists
 
-✅ Implemented (v0.1 core)
-- Postgres storage for typed objects (`ob_objects`) + append-only event log (`ob_events`)
-- Query DSL + deterministic structured search
-- Embedding pipeline:
-  - canonical text normalization + checksum (`sha256("ob.v0.1\n" + text)`)
-  - embedding dedupe by `(scope, provider, model, kind, checksum)` (provider defaults to `noop`, kind to `semantic`)
-  - `embed.generate`
-- Semantic search using pgvector cosine ranking with optional safe DSL filters
-- Local-first daemon:
-  - MCP stdio: `openbrain mcp` (**primary for agents**)
-  - HTTP: `openbrain serve` (**mirror/debug/SDK**)
+Most agent stacks still keep memory trapped inside provider-specific context windows. That makes state fragile, hard to audit, and difficult to share across models. OpenBrain exists to separate memory from model runtime: the model becomes a stateless compute adapter, while OpenBrain is the durable state plane with typed records, deterministic retrieval, and governance boundaries.
 
-🕒 Planned / not yet implemented
-- MCP-over-HTTP transport
-- Promotion workflow (`promote`), conflict detection (`conflicts.list`), timeline API, policy engine (`policy.explain`)
-- Auth / multi-user / remote deployment defaults (currently local-only)
-- Multi-dim embeddings (v0.2+)
+## Core concepts
 
----
+OpenBrain organizes memory by workspace (scope), which is the top-level isolation boundary for data and policy. Each workspace has ownership semantics and role-based access controls.
 
-## Quickstart
+Objects are typed memory records with versioned updates. Events are append-only facts about how those objects changed, who changed them, and when. Embeddings are stored in separate spaces keyed by provider, model, and kind, so the same object can be represented in multiple semantic spaces without changing vector dimensions.
 
-### Prerequisites
-- Rust toolchain (stable) and Cargo
-- Postgres with **pgvector** extension available
-- A `DATABASE_URL` pointing to the Postgres instance
+Lifecycle and conflict metadata are first-class. Objects can move through `scratch`, `candidate`, `accepted`, and `deprecated`, with TTL defaults and explicit expiry. Keyed memories use `memory_key` plus deterministic `value_hash` to mark conflicting values and capture resolution metadata.
 
-### Run Postgres + pgvector (example)
-Use any Postgres that has pgvector. Example Docker image:
-- `pgvector/pgvector:pg16`
+## How retrieval works (deterministic + governed)
 
-(See `CONTRIBUTING.md` for concrete commands and curl examples.)
+Default retrieval is strict: only `accepted` and non-expired objects are returned. This applies to scoped reads, structured search, and semantic search.
 
-### Migrate
-OpenBrain migrations live in `migrations/`.  
-Tests run migrations automatically via `sqlx::migrate::Migrator`.
+Clients can opt in to broader views using optional request fields:
+- `include_states`
+- `include_expired`
+- `now` (for deterministic evaluation)
 
----
+Semantic search can target a specific embedding space with `embedding_provider`, `embedding_model`, and `embedding_kind`. Governance still applies at read time: policy and role checks can deny or clamp requests even when the client asks for broader access.
+
+## Governance model (ownership, audit, retention, explainability)
+
+Workspaces are owned and governed. Ownership controls administrative actions such as token and policy management, while writer/reader roles control day-to-day memory operations.
+
+Auditability is built on immutable event history and timeline queries. Retention boundaries are policy-driven through `policy.retention` objects that define default TTLs, maximum TTL caps, and immutable kinds. These boundaries are enforced on write/update so retention decisions are deterministic and workspace-owned.
+
+When access is denied, responses include explainability fields (`reason_code` and `policy_rule_id`) so operators can understand which policy blocked the action without exposing sensitive data.
 
 ## Interfaces
 
-### MCP stdio (primary for agents)
-Run:
-```bash
-export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
-openbrain mcp
-```
+### MCP (primary for agents)
 
-Implemented tools (names exact):
+MCP stdio is the primary integration path for agent runtimes.
+
+Core capabilities:
 - `openbrain.ping`
 - `openbrain.write`
-- `openbrain.read` (scoped: `{ scope, refs }`)
+- `openbrain.read`
 - `openbrain.search.structured`
 - `openbrain.embed.generate`
 - `openbrain.search.semantic`
+
+Governance capabilities:
+- `openbrain.workspace.info`
+- `openbrain.audit.object_timeline`
+- `openbrain.audit.memory_key_timeline`
+- `openbrain.audit.actor_activity`
+
+Optional enrichment capabilities:
 - `openbrain.rerank`
 - `openbrain.memory.pack`
 
-### HTTP mirror (debug/SDK)
-Run:
-```bash
-export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
-openbrain serve
-```
+### HTTP (mirror/debug/SDK)
 
-Defaults:
-- Bind: `127.0.0.1`
-- Port: `7981`
+HTTP mirrors the MCP surface and is designed for local debugging, service composition, and SDK usage.
 
-Overrides:
-- `OPENBRAIN_BIND`
-- `OPENBRAIN_PORT`
-
-Endpoints (POST):
+Core endpoints:
 - `/v1/ping`
 - `/v1/write`
-- `/v1/read` (scoped)
+- `/v1/read`
 - `/v1/search/structured`
 - `/v1/embed/generate`
 - `/v1/search/semantic`
+
+Governance endpoints:
+- `/v1/workspace/info`
+- `/v1/audit/object_timeline`
+- `/v1/audit/memory_key_timeline`
+- `/v1/audit/actor_activity`
+
+Optional enrichment endpoints:
 - `/v1/rerank`
 - `/v1/memory/pack`
 
-### Parity guarantee
-MCP tools map **1:1** to the same store/service methods used by HTTP.  
-Response envelopes and error codes are identical across both interfaces.
+## Quickstart
 
----
+1. Start Postgres with `pgvector`, then set `DATABASE_URL`.
+2. Start OpenBrain HTTP locally:
+```bash
+openbrain serve
+```
+3. Authentication:
+- HTTP uses `Authorization: Bearer <token>`
+- MCP passes `auth_token` during initialize
 
-## SDK Quickstart (TS + Python)
+## SDKs
 
-SDKs live in:
+OpenBrain ships TypeScript and Python SDKs with both an HTTP client and an MCP helper:
 - `sdk/typescript/openbrain-sdk`
 - `sdk/python/openbrain_sdk`
 
-Start the local server (HTTP examples):
-```bash
-export DATABASE_URL="postgres://user:pass@localhost:5432/openbrain"
-export OPENBRAIN_EMBED_PROVIDER="fake"
-openbrain serve
+TypeScript:
+```ts
+import { OpenBrainHttpClient } from "@openbrain/openbrain-sdk";
+
+const client = new OpenBrainHttpClient({ baseUrl: "http://127.0.0.1:7981" });
+await client.ping();
+const matches = await client.searchSemantic({ scope: "workspace:demo", query: "release policy", top_k: 3 });
+console.log(matches.matches.length);
 ```
 
-Run TypeScript examples:
-```bash
-cd sdk/typescript/openbrain-sdk
-npm install
-npx tsx examples/http_e2e.ts
-npx tsx examples/mcp_e2e.ts
+Python:
+```python
+from openbrain_sdk import OpenBrainHttpClient
+from openbrain_sdk.models import SearchSemanticRequest
+
+client = OpenBrainHttpClient(base_url="http://127.0.0.1:7981")
+client.ping()
+result = client.search_semantic(SearchSemanticRequest(scope="workspace:demo", query="release policy", top_k=3))
+print(len(result.matches))
 ```
 
-Run Python examples:
-```bash
-cd sdk/python/openbrain_sdk
-py -3 -m pip install -e .
-py -3 examples/http_e2e.py
-py -3 examples/mcp_e2e.py
-```
+## Governance UX (CLI/TUI)
 
-Notes:
-- Examples run on localhost and do not require live API keys by default.
-- `openbrain.memory.pack` requires `ANTHROPIC_API_KEY` set for the OpenBrain process.
+The terminal UX focuses on inspectability and fast policy debugging. `openbrain workspace info` shows ownership and current caller role, `openbrain audit object|key|actor` provides bounded timelines, and `openbrain retention show` displays the effective retention policy. When a command is denied, CLI output surfaces explainability directly as `reason_code` plus `policy_rule_id`.
 
----
+## Quality and security checks
 
-## Embedding provider selection
+OpenBrain keeps local quality gates deterministic with a single entrypoint:
+- `scripts/ci/quality-gates.ps1` (Windows)
+- `scripts/ci/quality-gates.sh` (Unix)
 
-OpenBrain uses a pluggable `EmbeddingProvider`.
+The gate runs formatting, clippy, tests, `cargo deny`, and gitleaks checks. Live-network tests are opt-in only via explicit `RUN_*` flags and are forced off in the quality gate flow.
 
-Environment:
-- `OPENBRAIN_EMBED_PROVIDER=noop` (default)  
-- `OPENBRAIN_EMBED_PROVIDER=fake` (deterministic dev/test only)  
-- `OPENBRAIN_EMBED_PROVIDER=openai` (real embeddings)
-- `OPENBRAIN_EMBED_PROVIDER=local` (local HTTP embeddings)
+## Whats next
 
-OpenAI provider env (v0.1):
-- `OPENAI_API_KEY` (required when provider=openai)
-- `OPENAI_EMBED_MODEL` (optional; default: `text-embedding-3-small`)
-- `OPENAI_BASE_URL` (optional)
-- `OPENAI_TIMEOUT_SECS` (optional)
-- `OPENAI_EMBED_DIMS` (optional; if set must be 1536)
-
-> v0.1 uses a fixed embedding dimension of **1536** (pgvector column is `vector(1536)`).
-
-Local HTTP provider env (v0.1):
-- `LOCAL_EMBED_URL` (required when provider=local; example: `http://127.0.0.1:8080/embeddings`)
-- `LOCAL_EMBED_MODEL` (optional)
-- `LOCAL_EMBED_TIMEOUT_SECS` (optional)
-- `LOCAL_EMBED_HEADER_*` (optional; forwarded as HTTP headers)
-
-Local HTTP contract (implemented in v0.1):
-Request:
-```json
-{ "model": "optional-model", "input": "text..." }
-```
-
-Response:
-```json
-{ "data": [ { "embedding": [0.01, 0.02, "..."] } ] }
-```
-
-Claude rerank/pack env (v0.1):
-- `ANTHROPIC_API_KEY` (required for rerank/pack)
-- `ANTHROPIC_MODEL` (optional)
-- `ANTHROPIC_BASE_URL` (optional)
-- `ANTHROPIC_TIMEOUT_SECS` (optional)
-
-Claude is used **only** for rerank + memory pack summary. It is **not** an embedding provider.
-
----
-
-## HTTP API (Implemented)
-
-All endpoints are **POST** and accept/return JSON in a standard envelope.
-
-Success:
-```json
-{ "ok": true, "...": "..." }
-```
-
-Error:
-```json
-{
-  "ok": false,
-  "error": { "code": "OB_INVALID_REQUEST", "message": "...", "details": {} }
-}
-```
-
-### `POST /v1/ping`
-Response:
-```json
-{ "ok": true, "version": "0.1", "server_time": "2026-03-03T10:00:00Z" }
-```
-
-### `POST /v1/write`
-Request:
-```json
-{
-  "objects": [
-    {
-      "type":"claim",
-      "id":"clm_...",
-      "scope":"workspace:nyex",
-      "status":"draft",
-      "spec_version":"0.1",
-      "tags":[],
-      "provenance":{ "actor":"agent:nyex", "ts":"..." },
-      "data":{
-        "subject":{ "entity_id":"ent_..." },
-        "predicate":"requires",
-        "object":{ "value":"MCP HTTP", "entity_id":null },
-        "polarity":"affirm",
-        "confidence":0.8,
-        "evidence":[],
-        "props":{}
-      }
-    }
-  ],
-  "mode":"draft",
-  "idempotency_key":"optional"
-}
-```
-
-### `POST /v1/read` (scoped)
-Request:
-```json
-{ "scope": "workspace:nyex", "refs": ["clm_...", "dec_..."] }
-```
-
-### `POST /v1/search/structured`
-Request:
-```json
-{
-  "scope":"workspace:nyex",
-  "where":"type == \"task\" AND data.state == \"blocked\"",
-  "limit":50,
-  "offset":0,
-  "order_by":"updated_at DESC"
-}
-```
-
-### `POST /v1/embed/generate`
-Request (text):
-```json
-{ "scope":"workspace:nyex", "target": { "text":"routing budget policy" }, "model":"default" }
-```
-
-Request (ref):
-```json
-{ "scope":"workspace:nyex", "target": { "ref":"dec_..." }, "model":"default" }
-```
-
-### `POST /v1/search/semantic`
-Request:
-```json
-{
-  "scope":"workspace:nyex",
-  "query":"routing budget policy",
-  "top_k":10,
-  "model":"default",
-  "embedding_provider":"noop",
-  "embedding_model":"default",
-  "embedding_kind":"semantic",
-  "filters":"status IN [\"candidate\",\"canonical\"]",
-  "types":["decision","claim"],
-  "status":["candidate","canonical"]
-}
-```
-
-Response:
-```json
-{
-  "ok": true,
-  "matches": [
-    { "ref":"dec_...", "kind":"decision", "score":0.83, "updated_at":"2026-03-03T10:05:00Z", "snippet": null }
-  ]
-}
-```
-
----
-
-## Query DSL (v0.1 implemented)
-
-Supported operators:
-- comparisons: `== != > >= < <=`
-- membership: `IN [..]`
-- boolean: `AND OR NOT`
-- grouping: `( ... )`
-
-Not implemented in v0.1:
-- `~=` (regex match) — disabled (returns `OB_INVALID_REQUEST`)
-- `CONTAINS` — not implemented
-
-Field paths:
-- top-level: `type`, `id`, `scope`, `status`, `spec_version`, `created_at`, `updated_at`, `tags`
-- nested JSON: `data.<path>` (multi-level supported via JSON path)
-- `provenance.ts`
-
----
-
-## Storage schema (Postgres + pgvector)
-
-OpenBrain uses:
-- `ob_objects` — typed memory objects (JSONB `data` + `provenance`)
-- `ob_events` — append-only events
-- `ob_embeddings` — embeddings (`vector(1536)`), provider + model + kind
-
-See `migrations/0001_init.sql` for exact DDL + indexes.
-
----
-
-## Development
-
-Local quality gates (source of truth):
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all --all-features
-```
-
-DB tests:
-- Use `DATABASE_URL`. If missing, DB-backed tests may skip with a clear message (see `CONTRIBUTING.md`).
-
----
-
-## Roadmap (high level)
-
-- IT7B: Claude rerank + Memory Pack Builder
-- IT7C: Local embeddings provider
-- IT8: Expand provider ecosystem + multi-embedding strategy (optional, later)
+OpenBrain is now governed and auditable in terminal-first workflows; next work is about visibility and compliance ergonomics on top of the same policy engine and event trail.
+- Read-only web governance console
+- Compliance pack with tamper-evident event exports and redaction policy tooling
+- MCP-over-HTTP transport for broader deployment patterns
 
 ---
 
