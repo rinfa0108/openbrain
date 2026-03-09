@@ -51,7 +51,6 @@ Write mode guarantees:
 
 After write mode, inspect captured memories in the viewer:
 
-1. Start server: `openbrain serve`
-2. Open `http://127.0.0.1:7981/viewer`
+1. Start server: `openbrain serve`\n2. Open `http://127.0.0.1:7981/viewer`
 3. Paste a workspace token
 4. Use Object Inspector or Audit views to verify shadow captures and event trail

@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "openbrain")]
-#[command(version = openbrain_core::SPEC_VERSION)]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

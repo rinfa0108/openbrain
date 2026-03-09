@@ -1,6 +1,6 @@
 {
   "name": "@openbrain/openbrain-sdk",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "TypeScript SDK for OpenBrain HTTP + MCP surfaces",
   "license": "Apache-2.0 OR MIT",
   "type": "module",
