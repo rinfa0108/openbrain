@@ -135,6 +135,7 @@ The terminal UX focuses on inspectability and fast policy debugging. `openbrain 
 OpenBrain keeps local quality gates deterministic with a single entrypoint:
 - `scripts/ci/quality-gates.ps1` (Windows)
 - `scripts/ci/quality-gates.sh` (Unix)
+Trademark and branding policy: see `TRADEMARK.md`.
 
 The gate runs formatting, clippy, tests, `cargo deny`, and gitleaks checks. Live-network tests are opt-in only via explicit `RUN_*` flags and are forced off in the quality gate flow.
 
