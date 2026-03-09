@@ -26,6 +26,9 @@ Key request fields:
 - `budget_tokens` (default `1200`)
 - `top_k` (candidate cap)
 - `max_per_key` (default `1`)
+- `max_per_kind` (default `5`)
+- `max_per_source` (default `5`)
+- `min_kind_coverage` (optional, best-effort)
 - `include_states`, `include_expired`, `now` (override lifecycle defaults)
 - `include_conflicts_detail` (default `false`)
 
@@ -42,6 +45,26 @@ Candidate retrieval is hybrid:
 - semantic search path (if enabled)
 - union + stable rank + dedupe by `memory_key`
 
+Deterministic ranking score combines these fixed signals:
+- lifecycle weight: `accepted=40`, `candidate=20`, `scratch=10`, `deprecated=0`
+- semantic contribution: `semantic_score * 30` (when semantic path is used)
+- version contribution: `min(version, 1000) * 0.02`
+- memory-key prefix boost: `+8` when `memory_key_prefixes` match
+- policy include-type boost: `+6` for objects matched by `policy.include_types`
+- provenance/trust boost:
+  - source system (`jira`, `confluence`, `github`, `salesforce`): `+6`
+  - kind fallback: `decision`/`policy.*` `+5`, `runbook`/`evidence` `+3`, `task`/`preference` `+2`, otherwise `+1`
+  - `shadow` source penalty: `-4`
+- conflict penalty:
+  - unresolved conflict: `-8`
+  - resolved conflict: `-2`
+
+Stable tie-breakers are applied in this order:
+- score descending
+- `updated_at` descending
+- `version` descending
+- `object_id` ascending
+
 ## Budgeting and truncation
 
 Budget estimation is deterministic and local:
@@ -52,6 +75,16 @@ Builder behavior:
 - selection order is stable
 - if an item would exceed budget, assembly stops
 - `truncated=true` and `constraints` include `pack_truncated_to_budget`
+
+Diversity controls are deterministic and applied before budgeting:
+- `max_per_key` is always enforced (default `1`, safety invariant)
+- `max_per_kind` and `max_per_source` are enforced with defaults above
+- optional `min_kind_coverage` is attempted first
+
+If constraints over-constrain selection, relaxation is deterministic:
+1. relax `min_kind_coverage`
+2. relax `max_per_source`
+3. keep `max_per_key` fixed
 
 ## Conflict handling
 

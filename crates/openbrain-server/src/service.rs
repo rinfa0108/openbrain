@@ -6,7 +6,7 @@ use openbrain_llm::{AnthropicClient, LlmError};
 use openbrain_store::{GetObjectsRequest, SearchSemanticRequest, SearchStructuredRequest, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const MAX_CANDIDATES: usize = 100;
 const MAX_SNIPPET_LEN: usize = 400;
@@ -14,6 +14,21 @@ const DEFAULT_TOP_K: u32 = 20;
 const DEFAULT_BUDGET_TOKENS: u32 = 1200;
 const MAX_BUDGET_TOKENS: u32 = 8000;
 const MAX_VALUE_PREVIEW_CHARS: usize = 320;
+const DEFAULT_MAX_PER_KIND: u32 = 5;
+const DEFAULT_MAX_PER_SOURCE: u32 = 5;
+const MAX_PER_KIND_CAP: u32 = 20;
+const MAX_PER_SOURCE_CAP: u32 = 20;
+const MAX_MIN_KIND_COVERAGE: u32 = 10;
+const WEIGHT_STATE_ACCEPTED: f64 = 40.0;
+const WEIGHT_STATE_CANDIDATE: f64 = 20.0;
+const WEIGHT_STATE_SCRATCH: f64 = 10.0;
+const WEIGHT_STATE_DEPRECATED: f64 = 0.0;
+const WEIGHT_SEMANTIC: f64 = 30.0;
+const WEIGHT_VERSION: f64 = 0.02;
+const WEIGHT_KEY_PREFIX_MATCH: f64 = 8.0;
+const WEIGHT_KIND_FILTER_MATCH: f64 = 6.0;
+const PENALTY_CONFLICT_UNRESOLVED: f64 = 8.0;
+const PENALTY_CONFLICT_RESOLVED: f64 = 2.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankRequest {
@@ -75,6 +90,12 @@ pub struct MemoryPackRequest {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_key: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_kind: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_source: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_kind_coverage: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_states: Option<Vec<LifecycleState>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +203,8 @@ struct CandidateMeta {
     conflicting_object_ids: Option<Vec<String>>,
     resolved_by_object_id: Option<String>,
     resolved_at: Option<String>,
+    ranking_score: f64,
+    source_tag: String,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +332,18 @@ where
         .unwrap_or(DEFAULT_BUDGET_TOKENS)
         .clamp(1, MAX_BUDGET_TOKENS);
     let max_per_key = req.max_per_key.unwrap_or(1).clamp(1, 10) as usize;
+    let max_per_kind = req
+        .max_per_kind
+        .unwrap_or(DEFAULT_MAX_PER_KIND)
+        .clamp(1, MAX_PER_KIND_CAP) as usize;
+    let max_per_source = req
+        .max_per_source
+        .unwrap_or(DEFAULT_MAX_PER_SOURCE)
+        .clamp(1, MAX_PER_SOURCE_CAP) as usize;
+    let min_kind_coverage = req
+        .min_kind_coverage
+        .unwrap_or(0)
+        .min(MAX_MIN_KIND_COVERAGE) as usize;
     let include_conflicts = req.include_conflicts.unwrap_or(true);
     let include_conflicts_detail = req.include_conflicts_detail.unwrap_or(false);
     let use_semantic = req.semantic.unwrap_or_else(|| {
@@ -331,10 +366,22 @@ where
         Ok(v) => v,
         Err(e) => return Envelope::err(e),
     };
+    for candidate in &mut candidates {
+        candidate.meta.source_tag = provenance_source_tag(&candidate.object.provenance);
+        candidate.meta.ranking_score = score_candidate(candidate, &req, &policy);
+    }
     candidates.sort_by(compare_candidates);
+    let (candidates, relax_stage) = select_candidates_with_diversity(
+        candidates,
+        candidate_limit,
+        max_per_key,
+        max_per_kind,
+        max_per_source,
+        min_kind_coverage,
+        req.memory_key_prefixes.as_deref(),
+    );
 
     let mut selected_items = Vec::new();
-    let mut seen_by_key: HashMap<String, usize> = HashMap::new();
     let mut alerts_by_key: BTreeMap<String, MemoryPackConflictAlert> = BTreeMap::new();
     let mut text = format!(
         "MEMORY_PACK\nscope={}\nbudget_tokens={}\nselection=deterministic\n\n",
@@ -343,25 +390,6 @@ where
     let mut truncated = false;
 
     for candidate in candidates {
-        if let Some(prefixes) = req.memory_key_prefixes.as_ref() {
-            if let Some(key) = candidate.object.memory_key.as_ref() {
-                if !prefixes
-                    .iter()
-                    .any(|p| !p.trim().is_empty() && key.starts_with(p.trim()))
-                {
-                    continue;
-                }
-            }
-        }
-
-        if let Some(key) = candidate.object.memory_key.as_ref() {
-            let count = seen_by_key.get(key).copied().unwrap_or(0);
-            if count >= max_per_key {
-                continue;
-            }
-            seen_by_key.insert(key.clone(), count + 1);
-        }
-
         if candidate.meta.conflict || candidate.meta.conflict_status == ConflictStatus::Unresolved {
             if let Some(key) = candidate.object.memory_key.as_ref() {
                 alerts_by_key
@@ -470,9 +498,12 @@ where
                 .map(|i| i.id.clone())
                 .collect(),
             constraints: if truncated {
-                vec!["pack_truncated_to_budget".to_string()]
+                vec![
+                    "pack_truncated_to_budget".to_string(),
+                    format!("selection_relax_stage={relax_stage}"),
+                ]
             } else {
-                Vec::new()
+                vec![format!("selection_relax_stage={relax_stage}")]
             },
             relevant,
             conflicts: conflict_alerts
@@ -535,6 +566,8 @@ where
                     conflicting_object_ids: item.conflicting_object_ids,
                     resolved_by_object_id: item.resolved_by_object_id,
                     resolved_at: item.resolved_at,
+                    ranking_score: 0.0,
+                    source_tag: "unknown".to_string(),
                 });
             }
         }
@@ -573,6 +606,8 @@ where
                                 conflicting_object_ids: item.conflicting_object_ids.clone(),
                                 resolved_by_object_id: item.resolved_by_object_id.clone(),
                                 resolved_at: item.resolved_at.clone(),
+                                ranking_score: 0.0,
+                                source_tag: "unknown".to_string(),
                             });
                             entry.semantic_score =
                                 Some(entry.semantic_score.unwrap_or(item.score).max(item.score));
@@ -617,26 +652,327 @@ where
 }
 
 fn compare_candidates(a: &RankedCandidate, b: &RankedCandidate) -> std::cmp::Ordering {
-    state_rank(b.object.lifecycle_state)
-        .cmp(&state_rank(a.object.lifecycle_state))
-        .then_with(|| {
-            b.meta
-                .semantic_score
-                .partial_cmp(&a.meta.semantic_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    b.meta
+        .ranking_score
+        .partial_cmp(&a.meta.ranking_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| b.object.updated_at.cmp(&a.object.updated_at))
         .then_with(|| b.object.version.cmp(&a.object.version))
         .then_with(|| a.object.id.cmp(&b.object.id))
 }
 
-fn state_rank(state: LifecycleState) -> u8 {
+fn state_weight(state: LifecycleState) -> f64 {
     match state {
-        LifecycleState::Accepted => 4,
-        LifecycleState::Candidate => 3,
-        LifecycleState::Scratch => 2,
-        LifecycleState::Deprecated => 1,
+        LifecycleState::Accepted => WEIGHT_STATE_ACCEPTED,
+        LifecycleState::Candidate => WEIGHT_STATE_CANDIDATE,
+        LifecycleState::Scratch => WEIGHT_STATE_SCRATCH,
+        LifecycleState::Deprecated => WEIGHT_STATE_DEPRECATED,
     }
+}
+
+fn score_candidate(
+    candidate: &RankedCandidate,
+    req: &MemoryPackRequest,
+    policy: &PackPolicy,
+) -> f64 {
+    let mut score = state_weight(candidate.object.lifecycle_state);
+    if let Some(semantic_score) = candidate.meta.semantic_score {
+        score += (semantic_score as f64) * WEIGHT_SEMANTIC;
+    }
+    score += (candidate.object.version.max(0) as f64).min(1000.0) * WEIGHT_VERSION;
+    score += provenance_weight(&candidate.object.object_type, &candidate.object.provenance);
+
+    if let (Some(prefixes), Some(memory_key)) = (
+        req.memory_key_prefixes.as_ref(),
+        candidate.object.memory_key.as_ref(),
+    ) {
+        if prefixes
+            .iter()
+            .any(|p| !p.trim().is_empty() && memory_key.starts_with(p.trim()))
+        {
+            score += WEIGHT_KEY_PREFIX_MATCH;
+        }
+    }
+
+    if let Some(include_types) = policy.include_types.as_ref() {
+        if include_types
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case(&candidate.object.object_type))
+        {
+            score += WEIGHT_KIND_FILTER_MATCH;
+        }
+    }
+
+    if candidate.meta.conflict || candidate.meta.conflict_status == ConflictStatus::Unresolved {
+        score -= PENALTY_CONFLICT_UNRESOLVED;
+    } else if candidate.meta.conflict_status == ConflictStatus::Resolved {
+        score -= PENALTY_CONFLICT_RESOLVED;
+    }
+
+    score
+}
+
+fn provenance_source_tag(provenance: &Value) -> String {
+    ["source", "source_system", "system", "origin"]
+        .iter()
+        .find_map(|key| provenance.get(*key).and_then(Value::as_str))
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn provenance_weight(object_type: &str, provenance: &Value) -> f64 {
+    let source = provenance_source_tag(provenance);
+    if source.contains("shadow") {
+        return -4.0;
+    }
+    if source.contains("jira")
+        || source.contains("confluence")
+        || source.contains("github")
+        || source.contains("salesforce")
+    {
+        return 6.0;
+    }
+
+    match object_type {
+        "policy.rule" | "policy.retention" | "decision" => 5.0,
+        "runbook" | "evidence" => 3.0,
+        "task" | "preference" => 2.0,
+        _ => 1.0,
+    }
+}
+
+fn key_prefix_allowed(memory_key: Option<&String>, prefixes: Option<&[String]>) -> bool {
+    let Some(prefixes) = prefixes else {
+        return true;
+    };
+    if prefixes.is_empty() {
+        return true;
+    }
+    let Some(memory_key) = memory_key else {
+        return false;
+    };
+    prefixes
+        .iter()
+        .any(|p| !p.trim().is_empty() && memory_key.starts_with(p.trim()))
+}
+
+fn select_candidates_with_diversity(
+    candidates: Vec<RankedCandidate>,
+    candidate_limit: usize,
+    max_per_key: usize,
+    max_per_kind: usize,
+    max_per_source: usize,
+    min_kind_coverage: usize,
+    memory_key_prefixes: Option<&[String]>,
+) -> (Vec<RankedCandidate>, u8) {
+    let total_kinds = candidates
+        .iter()
+        .filter(|c| key_prefix_allowed(c.object.memory_key.as_ref(), memory_key_prefixes))
+        .map(|c| c.object.object_type.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let target_coverage = min_kind_coverage.min(total_kinds);
+
+    let stage0 = select_stage(
+        &candidates,
+        candidate_limit,
+        max_per_key,
+        max_per_kind,
+        Some(max_per_source),
+        target_coverage,
+        memory_key_prefixes,
+    );
+
+    if target_coverage > 0 {
+        let selected_kinds = stage0
+            .iter()
+            .map(|c| c.object.object_type.clone())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if selected_kinds < target_coverage {
+            let stage1 = select_stage(
+                &candidates,
+                candidate_limit,
+                max_per_key,
+                max_per_kind,
+                Some(max_per_source),
+                0,
+                memory_key_prefixes,
+            );
+            if stage1.len() < candidate_limit {
+                let stage2 = select_stage(
+                    &candidates,
+                    candidate_limit,
+                    max_per_key,
+                    max_per_kind,
+                    None,
+                    0,
+                    memory_key_prefixes,
+                );
+                return (stage2, 2);
+            }
+            return (stage1, 1);
+        }
+    }
+
+    if stage0.len() < candidate_limit {
+        let stage2 = select_stage(
+            &candidates,
+            candidate_limit,
+            max_per_key,
+            max_per_kind,
+            None,
+            target_coverage,
+            memory_key_prefixes,
+        );
+        return (stage2, 2);
+    }
+
+    (stage0, 0)
+}
+
+fn select_stage(
+    candidates: &[RankedCandidate],
+    candidate_limit: usize,
+    max_per_key: usize,
+    max_per_kind: usize,
+    max_per_source: Option<usize>,
+    min_kind_coverage: usize,
+    memory_key_prefixes: Option<&[String]>,
+) -> Vec<RankedCandidate> {
+    let mut selected = Vec::new();
+    let mut seen_keys: HashMap<String, usize> = HashMap::new();
+    let mut kind_counts: HashMap<String, usize> = HashMap::new();
+    let mut source_counts: HashMap<String, usize> = HashMap::new();
+    let mut covered_kinds: BTreeSet<String> = BTreeSet::new();
+
+    if min_kind_coverage > 0 {
+        for candidate in candidates {
+            if selected.len() >= candidate_limit || covered_kinds.len() >= min_kind_coverage {
+                break;
+            }
+            if !key_prefix_allowed(candidate.object.memory_key.as_ref(), memory_key_prefixes) {
+                continue;
+            }
+            if covered_kinds.contains(&candidate.object.object_type) {
+                continue;
+            }
+            if !can_select_candidate(
+                candidate,
+                max_per_key,
+                max_per_kind,
+                max_per_source,
+                &seen_keys,
+                &kind_counts,
+                &source_counts,
+            ) {
+                continue;
+            }
+            apply_candidate_selection(
+                candidate,
+                &mut selected,
+                &mut seen_keys,
+                &mut kind_counts,
+                &mut source_counts,
+                &mut covered_kinds,
+            );
+        }
+    }
+
+    for candidate in candidates {
+        if selected.len() >= candidate_limit {
+            break;
+        }
+        if !key_prefix_allowed(candidate.object.memory_key.as_ref(), memory_key_prefixes) {
+            continue;
+        }
+        if selected
+            .iter()
+            .any(|c: &RankedCandidate| c.object.id == candidate.object.id)
+        {
+            continue;
+        }
+        if !can_select_candidate(
+            candidate,
+            max_per_key,
+            max_per_kind,
+            max_per_source,
+            &seen_keys,
+            &kind_counts,
+            &source_counts,
+        ) {
+            continue;
+        }
+        apply_candidate_selection(
+            candidate,
+            &mut selected,
+            &mut seen_keys,
+            &mut kind_counts,
+            &mut source_counts,
+            &mut covered_kinds,
+        );
+    }
+
+    selected
+}
+
+fn can_select_candidate(
+    candidate: &RankedCandidate,
+    max_per_key: usize,
+    max_per_kind: usize,
+    max_per_source: Option<usize>,
+    seen_keys: &HashMap<String, usize>,
+    kind_counts: &HashMap<String, usize>,
+    source_counts: &HashMap<String, usize>,
+) -> bool {
+    if let Some(memory_key) = candidate.object.memory_key.as_ref() {
+        let key_count = seen_keys.get(memory_key).copied().unwrap_or(0);
+        if key_count >= max_per_key {
+            return false;
+        }
+    }
+
+    let kind_count = kind_counts
+        .get(&candidate.object.object_type)
+        .copied()
+        .unwrap_or(0);
+    if kind_count >= max_per_kind {
+        return false;
+    }
+
+    if let Some(max_per_source) = max_per_source {
+        let source_count = source_counts
+            .get(&candidate.meta.source_tag)
+            .copied()
+            .unwrap_or(0);
+        if source_count >= max_per_source {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn apply_candidate_selection(
+    candidate: &RankedCandidate,
+    selected: &mut Vec<RankedCandidate>,
+    seen_keys: &mut HashMap<String, usize>,
+    kind_counts: &mut HashMap<String, usize>,
+    source_counts: &mut HashMap<String, usize>,
+    covered_kinds: &mut BTreeSet<String>,
+) {
+    if let Some(memory_key) = candidate.object.memory_key.as_ref() {
+        *seen_keys.entry(memory_key.clone()).or_default() += 1;
+    }
+    *kind_counts
+        .entry(candidate.object.object_type.clone())
+        .or_default() += 1;
+    *source_counts
+        .entry(candidate.meta.source_tag.clone())
+        .or_default() += 1;
+    covered_kinds.insert(candidate.object.object_type.clone());
+    selected.push(candidate.clone());
 }
 
 fn preview_value(value: &Value) -> Value {
@@ -837,6 +1173,53 @@ fn map_llm_error(err: LlmError) -> ErrorEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate(
+        id: &str,
+        object_type: &str,
+        memory_key: Option<&str>,
+        source: &str,
+        semantic_score: Option<f32>,
+        version: i64,
+        lifecycle_state: LifecycleState,
+        conflict_status: ConflictStatus,
+    ) -> RankedCandidate {
+        RankedCandidate {
+            object: MemoryObjectStored {
+                object_type: object_type.to_string(),
+                id: id.to_string(),
+                scope: "ws-1".to_string(),
+                status: "canonical".to_string(),
+                spec_version: "0.1".to_string(),
+                tags: vec![],
+                data: json!({"value": id}),
+                provenance: json!({"source": source}),
+                version,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                lifecycle_state,
+                expires_at: None,
+                memory_key: memory_key.map(str::to_string),
+                conflict_status,
+                resolved_by_object_id: None,
+                resolved_at: None,
+                resolution_note: None,
+            },
+            meta: CandidateMeta {
+                semantic_score,
+                conflict: conflict_status == ConflictStatus::Unresolved,
+                conflict_status,
+                conflict_count: None,
+                conflicting_object_ids: None,
+                resolved_by_object_id: None,
+                resolved_at: None,
+                ranking_score: 0.0,
+                source_tag: source.to_string(),
+            },
+        }
+    }
 
     #[test]
     fn rerank_validation_requires_scope() {
@@ -860,5 +1243,166 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::ObInvalidRequest.as_str());
+    }
+
+    #[test]
+    fn deterministic_sort_prefers_trusted_over_shadow() {
+        let req = MemoryPackRequest {
+            scope: "ws-1".to_string(),
+            task_hint: "t".to_string(),
+            query: Some("q".to_string()),
+            structured_filter: None,
+            semantic: Some(true),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
+            budget_tokens: Some(1200),
+            top_k: Some(10),
+            max_per_key: Some(1),
+            max_per_kind: Some(5),
+            max_per_source: Some(5),
+            min_kind_coverage: Some(0),
+            include_states: None,
+            include_expired: None,
+            now: None,
+            include_conflicts: Some(true),
+            include_conflicts_detail: Some(false),
+            memory_key_prefixes: None,
+            policy: None,
+            llm_summary: Some(false),
+        };
+        let policy = PackPolicy::default();
+        let mut rows = vec![
+            candidate(
+                "a",
+                "decision",
+                Some("decision:db"),
+                "shadow",
+                Some(0.8),
+                1,
+                LifecycleState::Accepted,
+                ConflictStatus::None,
+            ),
+            candidate(
+                "b",
+                "decision",
+                Some("decision:db"),
+                "jira",
+                Some(0.7),
+                1,
+                LifecycleState::Accepted,
+                ConflictStatus::None,
+            ),
+        ];
+        for row in &mut rows {
+            row.meta.source_tag = provenance_source_tag(&row.object.provenance);
+            row.meta.ranking_score = score_candidate(row, &req, &policy);
+        }
+        rows.sort_by(compare_candidates);
+        assert_eq!(rows[0].object.id, "b");
+    }
+
+    #[test]
+    fn diversity_constraints_enforce_kind_and_source_caps() {
+        let rows = vec![
+            candidate(
+                "a",
+                "decision",
+                Some("decision:a"),
+                "jira",
+                Some(0.9),
+                1,
+                LifecycleState::Accepted,
+                ConflictStatus::None,
+            ),
+            candidate(
+                "b",
+                "decision",
+                Some("decision:b"),
+                "jira",
+                Some(0.8),
+                1,
+                LifecycleState::Accepted,
+                ConflictStatus::None,
+            ),
+            candidate(
+                "c",
+                "task",
+                Some("task:a"),
+                "confluence",
+                Some(0.7),
+                1,
+                LifecycleState::Accepted,
+                ConflictStatus::None,
+            ),
+        ];
+        let (picked, _) = select_candidates_with_diversity(rows, 10, 1, 1, 1, 0, None);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().any(|r| r.object.object_type == "decision"));
+        assert!(picked.iter().any(|r| r.object.object_type == "task"));
+    }
+
+    #[test]
+    fn unresolved_conflict_penalty_lowers_rank() {
+        let req = MemoryPackRequest {
+            scope: "ws-1".to_string(),
+            task_hint: "t".to_string(),
+            query: None,
+            structured_filter: None,
+            semantic: Some(false),
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_kind: None,
+            budget_tokens: Some(1200),
+            top_k: Some(10),
+            max_per_key: Some(1),
+            max_per_kind: Some(5),
+            max_per_source: Some(5),
+            min_kind_coverage: Some(0),
+            include_states: None,
+            include_expired: None,
+            now: None,
+            include_conflicts: Some(true),
+            include_conflicts_detail: Some(false),
+            memory_key_prefixes: None,
+            policy: None,
+            llm_summary: Some(false),
+        };
+        let policy = PackPolicy::default();
+        let clean = candidate(
+            "clean",
+            "claim",
+            Some("k:1"),
+            "notes",
+            None,
+            10,
+            LifecycleState::Accepted,
+            ConflictStatus::None,
+        );
+        let conflicted = candidate(
+            "conflict",
+            "claim",
+            Some("k:2"),
+            "notes",
+            None,
+            10,
+            LifecycleState::Accepted,
+            ConflictStatus::Unresolved,
+        );
+        let clean_score = score_candidate(&clean, &req, &policy);
+        let conflict_score = score_candidate(&conflicted, &req, &policy);
+        assert!(clean_score > conflict_score);
+    }
+
+    #[test]
+    fn memory_pack_request_is_backward_compatible_without_new_fields() {
+        let req: MemoryPackRequest = serde_json::from_value(json!({
+            "scope":"ws-1",
+            "task_hint":"summarize"
+        }))
+        .expect("deserialize request");
+        assert_eq!(req.max_per_kind, None);
+        assert_eq!(req.max_per_source, None);
+        assert_eq!(req.min_kind_coverage, None);
     }
 }
