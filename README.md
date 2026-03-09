@@ -95,6 +95,7 @@ Optional enrichment endpoints:
 ```bash
 openbrain serve
 ```
+Default local binary port is `http://127.0.0.1:7981`. If you use Docker Compose onboarding, the mapped app port is `http://127.0.0.1:8080` (including `/viewer`).
 3. Authentication:
 - HTTP uses `Authorization: Bearer <token>`
 - MCP passes `auth_token` during initialize
@@ -142,7 +143,7 @@ The gate runs formatting, clippy, tests, `cargo deny`, and gitleaks checks. Live
 ## Whats next
 
 OpenBrain is now governed and auditable in terminal-first workflows; next work is about visibility and compliance ergonomics on top of the same policy engine and event trail.
-- Read-only web governance console
+- Governance UX enhancements on top of the existing read-only `/viewer` surface
 - Compliance pack with tamper-evident event exports and redaction policy tooling
 - MCP-over-HTTP transport for broader deployment patterns
 
