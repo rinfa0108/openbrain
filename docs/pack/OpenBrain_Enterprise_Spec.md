@@ -91,3 +91,8 @@ Reference screenshots:
   - Mitigation: versioned `policy.retention` objects with reviewable event history.
 - Assumption: PostgreSQL with pgvector is available in target environments.
   - Mitigation: Compose path for local parity plus explicit enterprise deployment guidance.
+
+## Open Source Core vs Enterprise Extensions
+OpenBrain open source core remains fully buildable and usable for governed memory operations, including typed objects/events, lifecycle and retention enforcement, policy-gated retrieval, audit timelines, MCP and HTTP interfaces, SDKs, the read-only `/viewer`, shadow mode, re-embed coverage workflows, and deterministic memory packs.
+
+Planned enterprise extensions are separate from the OSS baseline and may include connector packs, advanced compliance/export tooling, governed snapshot/diff workflows, and higher-order policy bundles. These are boundary definitions, not delivery commitments.
