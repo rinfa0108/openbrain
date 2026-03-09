@@ -1,0 +1,10 @@
+decision: Standardize on Postgres for production durability and auditability
+decision: Keep sqlite only for local throwaway prototyping
+Alex likes concise rollout summaries with explicit risk callouts
+Priya prefers deterministic pack assembly before model invocation
+todo: backfill accepted memory objects for release readiness
+next: run coverage and reembed when switching embedding space
+The support workflow must not expose tokens in logs
+Exports should not include raw secrets and should be policy-filtered
+action: verify conflict resolution metadata for decision:db
+approved retention policy update for scratch and candidate defaults
