@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod embed_cli;
 mod governance_cli;
 mod mcp;
+mod shadow_cli;
 
 use openbrain_embed::{
     EmbeddingProvider, FakeEmbeddingProvider, LocalHttpEmbeddingProvider, NoopEmbeddingProvider,
@@ -10,8 +11,8 @@ use openbrain_embed::{
 };
 use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, policy, AppState};
-use openbrain_store::{AuthStore, PgStore};
-use std::{net::SocketAddr, sync::Arc};
+use openbrain_store::{AuthStore, PgStore, PutObjectsRequest, Store};
+use std::{io::Read as _, net::SocketAddr, sync::Arc};
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,33 @@ enum Command {
 
         #[command(subcommand)]
         command: EmbedCommand,
+    },
+
+    /// Shadow mode extraction from transcript text/json (dry-run by default)
+    Shadow {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: Option<String>,
+        #[arg(long = "workspace", alias = "scope", default_value = "default")]
+        workspace: String,
+        /// Required for --mode write-scratch
+        #[arg(long, env = "OPENBRAIN_TOKEN")]
+        token: Option<String>,
+        #[arg(long, value_parser = shadow_cli::parse_mode, default_value = "dry-run")]
+        mode: shadow_cli::ShadowMode,
+        #[arg(long)]
+        input: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
+        #[arg(long, value_parser = shadow_cli::parse_input_format, default_value = "text")]
+        format: shadow_cli::ShadowInputFormat,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long = "out-html")]
+        out_html: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
     },
 }
 
@@ -371,6 +399,38 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Shadow {
+            database_url,
+            workspace,
+            token,
+            mode,
+            input,
+            stdin,
+            format,
+            limit,
+            out,
+            out_html,
+            actor,
+        } => {
+            if let Err(e) = run_shadow_command(ShadowCommandArgs {
+                database_url,
+                workspace,
+                token,
+                mode,
+                input,
+                stdin,
+                input_format: format,
+                limit,
+                out,
+                out_html,
+                actor,
+            })
+            .await
+            {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -659,6 +719,199 @@ async fn run_embed_command(
     Ok(())
 }
 
+fn load_shadow_input(
+    input: Option<String>,
+    use_stdin: bool,
+) -> Result<String, openbrain_core::ErrorEnvelope> {
+    if let Some(path) = input {
+        return std::fs::read_to_string(&path).map_err(|e| {
+            openbrain_core::ErrorEnvelope::new(
+                openbrain_core::ErrorCode::ObInvalidRequest,
+                format!("failed to read --input file: {e}"),
+                Some(serde_json::json!({"path": path})),
+            )
+        });
+    }
+    if use_stdin {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+            openbrain_core::ErrorEnvelope::new(
+                openbrain_core::ErrorCode::ObInvalidRequest,
+                format!("failed to read --stdin: {e}"),
+                None,
+            )
+        })?;
+        return Ok(buf);
+    }
+    Err(openbrain_core::ErrorEnvelope::new(
+        openbrain_core::ErrorCode::ObInvalidRequest,
+        "provide either --input <file> or --stdin",
+        None,
+    ))
+}
+
+async fn run_shadow_command(args: ShadowCommandArgs) -> Result<(), String> {
+    let raw =
+        load_shadow_input(args.input, args.stdin).map_err(|e| shadow_cli::format_user_error(&e))?;
+    let candidates = shadow_cli::extract_candidates(&raw, args.input_format, args.limit as usize)
+        .map_err(|e| shadow_cli::format_user_error(&e))?;
+    let mut objects = shadow_cli::candidates_to_objects(&args.workspace, &candidates);
+
+    let written_refs = match args.mode {
+        shadow_cli::ShadowMode::DryRun => Vec::new(),
+        shadow_cli::ShadowMode::WriteScratch => {
+            let token = args.token.as_ref().ok_or_else(|| {
+                shadow_cli::format_user_error(&openbrain_core::ErrorEnvelope::new(
+                    openbrain_core::ErrorCode::ObInvalidRequest,
+                    "--token is required in --mode write-scratch",
+                    None,
+                ))
+            })?;
+            let store = connect_store(args.database_url, "noop".to_string()).await;
+            let auth = store
+                .auth_from_token(token)
+                .await
+                .map_err(|e| shadow_cli::format_user_error(&e))?;
+            if auth.workspace_id != args.workspace {
+                return Err(shadow_cli::format_user_error(
+                    &openbrain_core::ErrorEnvelope::new(
+                        openbrain_core::ErrorCode::ObForbidden,
+                        "token does not grant access to requested workspace",
+                        None,
+                    ),
+                ));
+            }
+            if !auth.role.can_write() {
+                return Err(shadow_cli::format_user_error(
+                    &openbrain_core::ErrorEnvelope::new(
+                        openbrain_core::ErrorCode::ObForbidden,
+                        "shadow write requires writer or owner role",
+                        None,
+                    ),
+                ));
+            }
+            let rules = policy::load_workspace_policies(&store, &args.workspace)
+                .await
+                .map_err(|e| shadow_cli::format_user_error(&e))?;
+            for obj in &objects {
+                let decision = policy::evaluate(
+                    &rules,
+                    &policy::EvalInput {
+                        role: auth.role,
+                        identity_id: &auth.identity_id,
+                        operation: policy::PolicyOperation::Write,
+                        object_kind: obj.object_type.as_deref(),
+                        memory_key: obj.memory_key.as_deref(),
+                        lifecycle_transition: None,
+                    },
+                );
+                if !decision.allowed {
+                    return Err(shadow_cli::format_user_error(
+                        &policy::deny_error_with_rule(
+                            decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                            decision.policy_rule_id.as_deref(),
+                            None,
+                        ),
+                    ));
+                }
+            }
+            let retention = policy::load_workspace_retention_policy(&store, &args.workspace)
+                .await
+                .map_err(|e| shadow_cli::format_user_error(&e))?;
+            policy::apply_retention_policy_to_objects(
+                retention.as_ref(),
+                &mut objects,
+                chrono::Utc::now(),
+            )
+            .map_err(|e| shadow_cli::format_user_error(&e))?;
+            let resp = store
+                .put_objects(PutObjectsRequest {
+                    objects: objects.clone(),
+                    actor: args.actor.clone(),
+                    idempotency_key: None,
+                })
+                .await;
+            let results = match resp {
+                openbrain_core::Envelope::Ok { data, .. } => data.results,
+                openbrain_core::Envelope::Err { error, .. } => {
+                    return Err(shadow_cli::format_user_error(&error));
+                }
+            };
+            store
+                .append_event(
+                    &args.workspace,
+                    "shadow.batch",
+                    args.actor.as_deref().unwrap_or(&auth.identity_id),
+                    serde_json::json!({
+                        "mode": "write-scratch",
+                        "count": results.len(),
+                        "kinds": candidates.iter().map(|c| c.kind.clone()).collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
+            results.into_iter().map(|r| r.r#ref).collect()
+        }
+    };
+
+    let report = shadow_cli::ShadowReport {
+        mode: match args.mode {
+            shadow_cli::ShadowMode::DryRun => "dry-run".to_string(),
+            shadow_cli::ShadowMode::WriteScratch => "write-scratch".to_string(),
+        },
+        workspace: args.workspace.clone(),
+        extracted_count: candidates.len(),
+        written_count: written_refs.len(),
+        extracted: candidates.clone(),
+        written_refs: written_refs.clone(),
+    };
+
+    match args.input_format {
+        shadow_cli::ShadowInputFormat::Json => {
+            let rendered = serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("failed to render report json: {e}"))?;
+            println!("{rendered}");
+        }
+        shadow_cli::ShadowInputFormat::Text => {
+            println!("{}", shadow_cli::format_candidates_text(&candidates));
+            println!("mode: {}", report.mode);
+            println!("workspace: {}", report.workspace);
+            println!("extracted_count: {}", report.extracted_count);
+            println!("written_count: {}", report.written_count);
+            if !report.written_refs.is_empty() {
+                println!("written_refs: {}", report.written_refs.join(","));
+            }
+        }
+    }
+
+    if let Some(path) = args.out {
+        let rendered = serde_json::to_string_pretty(&report)
+            .map_err(|e| format!("failed to render report json: {e}"))?;
+        std::fs::write(&path, rendered).map_err(|e| format!("failed to write --out file: {e}"))?;
+        println!("report_json: {path}");
+    }
+    if let Some(path) = args.out_html {
+        let html = shadow_cli::render_html_report(&report);
+        std::fs::write(&path, html).map_err(|e| format!("failed to write --out-html file: {e}"))?;
+        println!("report_html: {path}");
+    }
+
+    Ok(())
+}
+
+struct ShadowCommandArgs {
+    database_url: Option<String>,
+    workspace: String,
+    token: Option<String>,
+    mode: shadow_cli::ShadowMode,
+    input: Option<String>,
+    stdin: bool,
+    input_format: shadow_cli::ShadowInputFormat,
+    limit: u32,
+    out: Option<String>,
+    out_html: Option<String>,
+    actor: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +1016,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_shadow_dry_run_command() {
+        let cli = Cli::try_parse_from([
+            "openbrain",
+            "shadow",
+            "--workspace",
+            "ws-default",
+            "--stdin",
+            "--mode",
+            "dry-run",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Command::Shadow { .. }));
     }
 }

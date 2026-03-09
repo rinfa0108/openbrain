@@ -8,7 +8,7 @@ It stores **typed, versioned memory objects** (claims, decisions, tasks, artifac
 > **NOTE (Do not edit without explicit instruction):**  
 > The **header + hero lines** above and the **License/footer** at the end of this README are considered **project identity text**.  
 > Please **refrain from changing** them unless explicitly instructed by the project owner.
-
+> Contributors: Richard Infantado (richard.infantado@gmail.com), Robert Leroux (rl.isapience@gmail.com)
 ---
 
 ## Why OpenBrain exists
