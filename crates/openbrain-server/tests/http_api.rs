@@ -947,3 +947,127 @@ async fn http_governance_workspace_audit_retention_and_explainability() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn http_memory_pack_policy_deny_and_clamp() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+    let pool = setup_pool().await.expect("pool");
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner").await;
+    let writer_token = create_token_for_workspace(&pool, &workspace_id, "writer").await;
+    let reader_token = create_token_for_workspace(&pool, &workspace_id, "reader").await;
+    let client = reqwest::Client::new();
+    let base = server.base.clone();
+
+    let rule_deny_reader = json!({
+        "objects": [{
+            "type":"policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status":"canonical",
+            "spec_version":"0.1",
+            "tags":[],
+            "data":{
+                "id":"deny-reader-memory-pack",
+                "effect":"deny",
+                "operations":["memory_pack"],
+                "roles":["reader"],
+                "reason":"OB_POLICY_DENY_MEMORY_PACK"
+            },
+            "provenance":{"actor":"owner"}
+        }]
+    });
+    let deny_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&rule_deny_reader)
+        .send()
+        .await
+        .expect("policy deny write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy deny write json");
+    assert_eq!(deny_write["ok"].as_bool(), Some(true));
+
+    let rule_clamp = json!({
+        "objects": [{
+            "type":"policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status":"canonical",
+            "spec_version":"0.1",
+            "tags":[],
+            "data":{
+                "id":"clamp-memory-pack-top-k",
+                "effect":"allow",
+                "operations":["memory_pack"],
+                "roles":["writer"],
+                "constraints":{"max_top_k":1},
+                "reason":"OB_POLICY_ALLOW_MEMORY_PACK_CLAMP"
+            },
+            "provenance":{"actor":"owner"}
+        }]
+    });
+    let clamp_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&rule_clamp)
+        .send()
+        .await
+        .expect("policy clamp write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy clamp write json");
+    assert_eq!(clamp_write["ok"].as_bool(), Some(true));
+
+    let obj_a = format!("claim-{}", uuid::Uuid::new_v4());
+    let obj_b = format!("claim-{}", uuid::Uuid::new_v4());
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects":[
+                {"type":"claim","id":obj_a,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"k":"a"},"provenance":{"actor":"writer"},"lifecycle_state":"accepted"},
+                {"type":"claim","id":obj_b,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"k":"b"},"provenance":{"actor":"writer"},"lifecycle_state":"accepted"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("object write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("object write json");
+    assert_eq!(write["ok"].as_bool(), Some(true));
+
+    let denied = client
+        .post(format!("{}/v1/memory/pack", base))
+        .bearer_auth(&reader_token)
+        .json(&json!({"scope": workspace_id, "task_hint":"test", "top_k": 10}))
+        .send()
+        .await
+        .expect("pack denied")
+        .json::<serde_json::Value>()
+        .await
+        .expect("pack denied json");
+    assert_eq!(denied["error"]["code"].as_str(), Some("OB_FORBIDDEN"));
+    assert_eq!(
+        denied["error"]["details"]["reason_code"].as_str(),
+        Some("OB_POLICY_DENY_MEMORY_PACK")
+    );
+
+    let clamped = client
+        .post(format!("{}/v1/memory/pack", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({"scope": workspace_id, "task_hint":"test", "top_k": 10, "semantic": false}))
+        .send()
+        .await
+        .expect("pack clamped")
+        .json::<serde_json::Value>()
+        .await
+        .expect("pack clamped json");
+    assert_eq!(clamped["ok"].as_bool(), Some(true));
+    assert_eq!(clamped["pack"]["items_selected"].as_u64(), Some(1));
+
+    server.shutdown().await;
+}
