@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openbrain-sdk"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python SDK for OpenBrain HTTP and MCP interfaces"
 license = { text = "Apache-2.0 OR MIT" }
 requires-python = ">=3.10"

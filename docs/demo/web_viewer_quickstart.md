@@ -10,7 +10,7 @@ openbrain serve
 
 Open the viewer:
 
-- `http://127.0.0.1:8080/viewer`
+- `http://127.0.0.1:7981/viewer`
 
 ## Token setup
 
@@ -22,7 +22,7 @@ Use a workspace token from the IT11A demo kit (`.openbrain/demo_tokens.json`) an
 ## What you can inspect
 
 1. Connection panel:
-- Set base URL (default `http://127.0.0.1:8080`), save token, run ping.
+- Set base URL (default `http://127.0.0.1:7981`), save token, run ping.
 
 2. Workspace panel:
 - Load `workspace_id`, `owner_identity_id`, `caller_identity_id`, `caller_role`.

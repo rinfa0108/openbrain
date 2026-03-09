@@ -81,8 +81,8 @@ Example:
 
 ```bash
 openbrain embed coverage --workspace ws_demo --provider fake --model fake-v1 --kind semantic
-openbrain embed reembed --workspace ws_demo --to-provider fake --to-model fake-v2 --to-kind semantic --dry-run --limit 100
-openbrain embed reembed --workspace ws_demo --to-provider fake --to-model fake-v2 --to-kind semantic --limit 100
+openbrain embed --token <token> reembed --workspace ws_demo --to-provider fake --to-model fake-v2 --to-kind semantic --dry-run --limit 100
+openbrain embed --token <token> reembed --workspace ws_demo --to-provider fake --to-model fake-v2 --to-kind semantic --limit 100
 ```
 
 Re-embed obeys lifecycle defaults (accepted + not expired) and policy constraints.
@@ -119,6 +119,6 @@ openbrain audit object <object_id>
 openbrain audit key <memory_key>
 openbrain audit actor <identity_id>
 openbrain retention show
-openbrain embed coverage --workspace <id> --provider <p> --model <m>
-openbrain embed reembed --workspace <id> --to-provider <p> --to-model <m> --dry-run
+openbrain embed --token <token> coverage --workspace <id> --provider <p> --model <m>
+openbrain embed --token <token> reembed --workspace <id> --to-provider <p> --to-model <m> --dry-run
 ```
