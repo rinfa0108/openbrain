@@ -656,7 +656,31 @@ where
     if let Err(e) = auth::ensure_scope(&auth, &req.scope) {
         return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e));
     }
-
+    let policies = match policy::load_workspace_policies(&state.store, &auth.workspace_id).await {
+        Ok(v) => v,
+        Err(e) => return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(e)),
+    };
+    let decision = policy::evaluate(
+        &policies,
+        &policy::EvalInput {
+            identity_id: &auth.identity_id,
+            role: auth.role,
+            operation: policy::PolicyOperation::MemoryPack,
+            object_kind: None,
+            memory_key: None,
+            lifecycle_transition: None,
+        },
+    );
+    if !decision.allowed {
+        return Json::<Envelope<service::MemoryPackResponse>>(Envelope::err(
+            policy::deny_error_with_rule(
+                decision.reason_code.as_deref().unwrap_or("OB_POLICY_DENY"),
+                decision.policy_rule_id.as_deref(),
+                Some(serde_json::json!({"operation":"memory_pack"})),
+            ),
+        ));
+    }
+    let req = service::apply_pack_request_clamps(req, decision.max_top_k);
     Json(service::build_pack(&state.store, &state.llm, req).await)
 }
 
