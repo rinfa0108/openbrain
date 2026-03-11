@@ -449,20 +449,28 @@ impl PgStore {
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or("system.reembed");
-            self.append_event(
-                scope,
-                "embed.reembed.batch",
-                actor,
-                serde_json::json!({
-                    "scope": scope,
-                    "provider": provider,
-                    "model": model,
-                    "kind": kind,
-                    "processed": processed,
-                    "bytes_processed": bytes_processed,
-                }),
-            )
-            .await;
+            if let Err(e) = self
+                .append_event(
+                    scope,
+                    "embed.reembed.batch",
+                    actor,
+                    serde_json::json!({
+                        "scope": scope,
+                        "provider": provider,
+                        "model": model,
+                        "kind": kind,
+                        "processed": processed,
+                        "bytes_processed": bytes_processed,
+                    }),
+                )
+                .await
+            {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("reembed audit event append failed: {}", e.message),
+                    e.details,
+                ));
+            }
         }
 
         Ok(EmbeddingReembedResponse {
@@ -2477,8 +2485,8 @@ impl Store for PgStore {
         event_type: &str,
         actor: &str,
         payload_json: Value,
-    ) -> () {
-        let _ = sqlx::query(
+    ) -> Result<(), ErrorEnvelope> {
+        sqlx::query(
             r#"INSERT INTO ob_events (scope, event_type, actor, payload)
                VALUES ($1, $2, $3, $4)"#,
         )
@@ -2487,7 +2495,18 @@ impl Store for PgStore {
         .bind(actor)
         .bind(sqlx::types::Json(&payload_json))
         .execute(&self.pool)
-        .await;
+        .await
+        .map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("event append failed: {e}"),
+                Some(serde_json::json!({
+                    "scope": scope,
+                    "event_type": event_type
+                })),
+            )
+        })?;
+        Ok(())
     }
 
     async fn audit_object_timeline(
@@ -2928,7 +2947,13 @@ impl AuthStore for PgStore {
             })?;
 
         if has_tokens.is_some() {
-            tx.commit().await.ok();
+            tx.commit().await.map_err(|e| {
+                ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("bootstrap commit failed: {e}"),
+                    None,
+                )
+            })?;
             return Ok(None);
         }
 
@@ -2988,7 +3013,13 @@ impl AuthStore for PgStore {
             )
         })?;
 
-        tx.commit().await.ok();
+        tx.commit().await.map_err(|e| {
+            ErrorEnvelope::new(
+                ErrorCode::ObStorageError,
+                format!("bootstrap commit failed: {e}"),
+                None,
+            )
+        })?;
 
         Ok(Some(BootstrapToken {
             token,

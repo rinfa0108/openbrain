@@ -1,7 +1,9 @@
 mod pg;
 
 use async_trait::async_trait;
-use openbrain_core::{ConflictStatus, Envelope, LifecycleState, MemoryObject, MemoryObjectStored};
+use openbrain_core::{
+    ConflictStatus, Envelope, ErrorEnvelope, LifecycleState, MemoryObject, MemoryObjectStored,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -417,7 +419,7 @@ pub trait Store: Send + Sync {
         event_type: &str,
         actor: &str,
         payload_json: Value,
-    ) -> ();
+    ) -> Result<(), ErrorEnvelope>;
 
     async fn audit_object_timeline(
         &self,

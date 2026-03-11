@@ -335,3 +335,72 @@ async fn reembed_dry_run_does_not_write_embeddings() {
     .expect("count embeddings");
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn reembed_surfaces_event_append_failure() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+    let scope = format!("scope-{}", Uuid::new_v4());
+    let id = format!("obj-{}", Uuid::new_v4());
+    let fn_suffix = Uuid::new_v4().to_string().replace('-', "_");
+    let fn_name = format!("ob_fail_embed_reembed_event_{fn_suffix}");
+    let trigger_name = format!("trg_fail_embed_reembed_event_{fn_suffix}");
+
+    let store = PgStore::from_pool_with_embedder_and_provider(
+        pool.clone(),
+        Arc::new(FakeEmbeddingProvider),
+        "fake",
+    );
+    let _ = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![obj_claim(&id, &scope, Some(LifecycleState::Accepted))],
+            actor: None,
+            idempotency_key: None,
+        })
+        .await;
+
+    let escaped_scope = scope.replace('\'', "''");
+    let create_fn_sql = format!(
+        "CREATE FUNCTION {fn_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_type = 'embed.reembed.batch' AND NEW.scope = '{escaped_scope}' THEN RAISE EXCEPTION 'forced event append failure'; END IF; RETURN NEW; END; $$;"
+    );
+    let create_trigger_sql = format!(
+        "CREATE TRIGGER {trigger_name} BEFORE INSERT ON ob_events FOR EACH ROW EXECUTE FUNCTION {fn_name}();"
+    );
+    sqlx::query(&create_fn_sql)
+        .execute(&pool)
+        .await
+        .expect("create failing trigger function");
+    sqlx::query(&create_trigger_sql)
+        .execute(&pool)
+        .await
+        .expect("create failing trigger");
+
+    let err = store
+        .reembed_missing(EmbeddingReembedRequest {
+            scope: scope.clone(),
+            to_provider: "fake".to_string(),
+            to_model: "fake-v1".to_string(),
+            to_kind: "semantic".to_string(),
+            state: LifecycleState::Accepted,
+            limit: Some(10),
+            after: None,
+            dry_run: false,
+            max_bytes: None,
+            max_objects: None,
+            actor: Some("tester".to_string()),
+        })
+        .await
+        .expect_err("event append failure should surface");
+    assert_eq!(err.code, "OB_STORAGE_ERROR");
+    assert!(
+        err.message.contains("reembed audit event append failed"),
+        "unexpected error message: {}",
+        err.message
+    );
+
+    let drop_trigger_sql = format!("DROP TRIGGER IF EXISTS {trigger_name} ON ob_events;");
+    let drop_fn_sql = format!("DROP FUNCTION IF EXISTS {fn_name}();");
+    let _ = sqlx::query(&drop_trigger_sql).execute(&pool).await;
+    let _ = sqlx::query(&drop_fn_sql).execute(&pool).await;
+}

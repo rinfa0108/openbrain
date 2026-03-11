@@ -1046,6 +1046,21 @@ fn estimate_tokens(text: &str) -> u32 {
     (text.chars().count() as u32).div_ceil(4)
 }
 
+pub fn estimate_pack_text_tokens(text: &str) -> u32 {
+    estimate_tokens(text)
+}
+
+pub fn render_pack_text(scope: &str, budget_requested: u32, items: &[MemoryPackItem]) -> String {
+    let mut text = format!(
+        "MEMORY_PACK\nscope={}\nbudget_tokens={}\nselection=deterministic\n\n",
+        scope, budget_requested
+    );
+    for item in items {
+        text.push_str(&format_item_block(item));
+    }
+    text
+}
+
 async fn summarize_pack(
     llm: &AnthropicClient,
     pack: &MemoryPack,

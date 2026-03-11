@@ -12,7 +12,7 @@ use openbrain_embed::{
 use openbrain_llm::AnthropicClient;
 use openbrain_server::{build_router, policy, AppState};
 use openbrain_store::{AuthStore, PgStore, PutObjectsRequest, Store};
-use std::{io::Read as _, net::SocketAddr, sync::Arc};
+use std::{io::Read as _, net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -288,13 +288,47 @@ async fn connect_store(database_url: Option<String>, embed_provider: String) -> 
     }
 }
 
-async fn bootstrap_default_workspace(store: &PgStore) {
+#[derive(Clone, Copy)]
+enum BootstrapOutput {
+    StderrPathOnly,
+    Suppress,
+}
+
+fn persist_bootstrap_token(token: &openbrain_store::BootstrapToken) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(".openbrain");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create .openbrain dir: {e}"))?;
+    let path = dir.join("bootstrap_token.txt");
+    let content = format!(
+        "workspace_id={}\nrole={}\ntoken={}\n",
+        token.workspace_id,
+        token.role.as_str(),
+        token.token
+    );
+    std::fs::write(&path, content)
+        .map_err(|e| format!("failed to write bootstrap token file: {e}"))?;
+    Ok(path)
+}
+
+async fn bootstrap_default_workspace(store: &PgStore, output: BootstrapOutput) {
     match store.bootstrap_default_workspace().await {
         Ok(Some(token)) => {
-            println!(
-                "bootstrap owner token (workspace={}): {}",
-                token.workspace_id, token.token
-            );
+            if matches!(output, BootstrapOutput::StderrPathOnly) {
+                match persist_bootstrap_token(&token) {
+                    Ok(path) => {
+                        eprintln!(
+                            "bootstrap owner token generated for workspace={}; saved to {}",
+                            token.workspace_id,
+                            path.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "bootstrap owner token generated for workspace={} (token value suppressed): {}",
+                            token.workspace_id, e
+                        );
+                    }
+                }
+            }
         }
         Ok(None) => {}
         Err(e) => {
@@ -317,7 +351,7 @@ async fn main() {
             embed_provider,
         } => {
             let store = connect_store(database_url, embed_provider).await;
-            bootstrap_default_workspace(&store).await;
+            bootstrap_default_workspace(&store, BootstrapOutput::StderrPathOnly).await;
 
             let addr: SocketAddr = format!("{}:{}", bind, port).parse().unwrap_or_else(|_| {
                 eprintln!("invalid bind/port: {bind}:{port}");
@@ -353,7 +387,7 @@ async fn main() {
             embed_provider,
         } => {
             let store = connect_store(database_url, embed_provider).await;
-            bootstrap_default_workspace(&store).await;
+            bootstrap_default_workspace(&store, BootstrapOutput::Suppress).await;
 
             info!(
                 "OpenBrain MCP stdio (spec v{})",
@@ -837,7 +871,7 @@ async fn run_shadow_command(args: ShadowCommandArgs) -> Result<(), String> {
                     return Err(shadow_cli::format_user_error(&error));
                 }
             };
-            store
+            if let Err(e) = store
                 .append_event(
                     &args.workspace,
                     "shadow.batch",
@@ -848,7 +882,10 @@ async fn run_shadow_command(args: ShadowCommandArgs) -> Result<(), String> {
                         "kinds": candidates.iter().map(|c| c.kind.clone()).collect::<Vec<_>>(),
                     }),
                 )
-                .await;
+                .await
+            {
+                return Err(shadow_cli::format_user_error(&e));
+            }
             results.into_iter().map(|r| r.r#ref).collect()
         }
     };

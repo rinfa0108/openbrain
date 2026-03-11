@@ -741,7 +741,14 @@ where
             }
 
             let req = service::apply_pack_request_clamps(req, decision.max_top_k);
-            envelope_to_value(service::build_pack(&store, &llm, req).await)
+            let pack = service::build_pack(&store, &llm, req).await;
+            let filtered = policy::filter_memory_pack_response(
+                pack,
+                &policies,
+                &auth_ctx.identity_id,
+                auth_ctx.role,
+            );
+            envelope_to_value(filtered)
         }
         "openbrain.workspace.token.create" => {
             let Some(auth_ctx) = auth_ctx else {
