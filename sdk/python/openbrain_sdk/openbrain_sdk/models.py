@@ -74,6 +74,11 @@ class PutResult(FromDictMixin):
 @dataclass
 class PutObjectsResponse(FromDictMixin):
     results: List[PutResult]
+    replayed: bool = False
+    request_id: Optional[str] = None
+    accepted_count: int = 0
+    object_ids: List[str] = field(default_factory=list)
+    receipt_hash: Optional[str] = None
 
 
 @dataclass
@@ -196,4 +201,3 @@ class MemoryPackResponse(FromDictMixin):
 class PingResponse(FromDictMixin):
     version: str
     server_time: str
-
