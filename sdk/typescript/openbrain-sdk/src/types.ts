@@ -46,6 +46,11 @@ export interface PutResult {
 
 export interface PutObjectsResponse {
   results: PutResult[];
+  replayed?: boolean;
+  request_id?: string;
+  accepted_count?: number;
+  object_ids?: string[];
+  receipt_hash?: string;
 }
 
 export interface ReadRequest {
@@ -227,4 +232,3 @@ export interface OpenBrainHttpResponseMap {
   "rerank": RerankResponse;
   "memory.pack": MemoryPackResponse;
 }
-

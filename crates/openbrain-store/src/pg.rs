@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use openbrain_core::query::{parse_where, CmpOp, Expr, FieldPath, Literal, Predicate};
 use openbrain_core::textnorm::{
-    checksum_v01, normalize_object_text, validate_embedding_text, value_hash_v01,
+    canonicalize_json, checksum_v01, normalize_object_text, validate_embedding_text, value_hash_v01,
 };
 use openbrain_core::{
     ConflictStatus, Envelope, ErrorCode, ErrorEnvelope, LifecycleState, MemoryObjectStored,
@@ -39,6 +39,8 @@ const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 const DEFAULT_REEMBED_LIMIT: u32 = 100;
 const MAX_REEMBED_LIMIT: u32 = 500;
 const MAX_REEMBED_MISSING_SAMPLE: u32 = 25;
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+const RECEIPT_OBJECT_IDS_CAP: usize = 50;
 
 fn embedding_to_pgvector_literal(embedding: &[f32]) -> Result<String, ErrorEnvelope> {
     let mut out = String::with_capacity(embedding.len() * 12 + 2);
@@ -777,6 +779,94 @@ struct ConflictInfo {
     ids: Vec<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct IdempotencyRow {
+    request_hash: String,
+    receipt_hash: String,
+    accepted_count: i64,
+    object_ids: Vec<String>,
+    results_json: sqlx::types::Json<Vec<PutResult>>,
+}
+
+fn compute_request_hash(
+    scope: &str,
+    actor: Option<&str>,
+    objects: &[ValidatedMemoryObject],
+) -> String {
+    let canonical_objects: Vec<Value> = objects
+        .iter()
+        .map(|obj| {
+            canonicalize_json(&serde_json::json!({
+                "type": obj.object_type,
+                "id": obj.id,
+                "scope": obj.scope,
+                "status": obj.status,
+                "spec_version": obj.spec_version,
+                "tags": obj.tags,
+                "data": obj.data,
+                "provenance": obj.provenance,
+                "lifecycle_state": obj.lifecycle_state.as_str(),
+                "expires_at": obj.expires_at,
+                "memory_key": obj.memory_key,
+                "conflict_status": obj.conflict_status.as_str(),
+                "resolved_by_object_id": obj.resolved_by_object_id,
+                "resolved_at": obj.resolved_at,
+                "resolution_note": obj.resolution_note,
+            }))
+        })
+        .collect();
+    let canonical = canonicalize_json(&serde_json::json!({
+        "scope": scope,
+        "actor": actor.map(str::trim).filter(|v| !v.is_empty()),
+        "objects": canonical_objects,
+    }));
+    let payload = serde_json::to_vec(&canonical).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"ob.idempotency.request.v1\n");
+    hasher.update(&payload);
+    hex_encode(&hasher.finalize())
+}
+
+fn compute_receipt_hash(
+    request_hash: &str,
+    accepted_count: usize,
+    object_ids: &[String],
+    results: &[PutResult],
+) -> String {
+    let canonical = canonicalize_json(&serde_json::json!({
+        "request_hash": request_hash,
+        "accepted_count": accepted_count,
+        "object_ids": object_ids,
+        "results": results,
+    }));
+    let payload = serde_json::to_vec(&canonical).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"ob.idempotency.receipt.v1\n");
+    hasher.update(&payload);
+    hex_encode(&hasher.finalize())
+}
+
+fn make_put_response(
+    results: Vec<PutResult>,
+    replayed: bool,
+    request_hash: Option<String>,
+    receipt_hash: Option<String>,
+) -> PutObjectsResponse {
+    let accepted_count = results.len();
+    let mut object_ids: Vec<String> = results.iter().map(|r| r.r#ref.clone()).collect();
+    if object_ids.len() > RECEIPT_OBJECT_IDS_CAP {
+        object_ids.truncate(RECEIPT_OBJECT_IDS_CAP);
+    }
+    PutObjectsResponse {
+        results,
+        replayed,
+        request_id: request_hash,
+        accepted_count,
+        object_ids,
+        receipt_hash,
+    }
+}
+
 fn include_conflicts_enabled(flag: Option<bool>) -> bool {
     flag.unwrap_or(true)
 }
@@ -1365,8 +1455,7 @@ impl Store for PgStore {
             }
         };
 
-        let mut results = Vec::with_capacity(req.objects.len());
-
+        let mut validated_objects = Vec::with_capacity(req.objects.len());
         for obj in &req.objects {
             let validated = match obj.validate() {
                 Ok(v) => v,
@@ -1375,7 +1464,109 @@ impl Store for PgStore {
                     return Envelope::err(err);
                 }
             };
+            validated_objects.push(validated);
+        }
 
+        let mut idempotency_scope: Option<String> = None;
+        let mut idempotency_key: Option<String> = None;
+        let mut request_hash: Option<String> = None;
+
+        if let Some(raw_key) = req.idempotency_key.as_deref() {
+            let key = raw_key.trim();
+            if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+                let _ = tx.rollback().await;
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "invalid idempotency_key length",
+                    Some(serde_json::json!({
+                        "reason_code": "OB_IDEMPOTENCY_KEY_INVALID",
+                        "max_len": MAX_IDEMPOTENCY_KEY_LEN
+                    })),
+                ));
+            }
+            if validated_objects.is_empty() {
+                let _ = tx.rollback().await;
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "idempotency_key requires at least one object",
+                    Some(serde_json::json!({"reason_code": "OB_IDEMPOTENCY_KEY_EMPTY_BATCH"})),
+                ));
+            }
+            let scope = validated_objects[0].scope.clone();
+            if validated_objects.iter().any(|o| o.scope != scope) {
+                let _ = tx.rollback().await;
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObInvalidRequest,
+                    "idempotency_key requires a single scope per request",
+                    Some(serde_json::json!({"reason_code": "OB_IDEMPOTENCY_SCOPE_MISMATCH"})),
+                ));
+            }
+
+            let computed_request_hash =
+                compute_request_hash(&scope, req.actor.as_deref(), &validated_objects);
+
+            let existing: Option<IdempotencyRow> = match sqlx::query_as(
+                r#"SELECT request_hash, receipt_hash, accepted_count, object_ids, results_json
+                   FROM ob_idempotency
+                   WHERE scope = $1 AND idempotency_key = $2
+                   FOR UPDATE"#,
+            )
+            .bind(&scope)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Envelope::err(ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("idempotency lookup failed: {e}"),
+                        None,
+                    ));
+                }
+            };
+
+            if let Some(row) = existing {
+                if row.request_hash != computed_request_hash {
+                    let _ = tx.rollback().await;
+                    return Envelope::err(ErrorEnvelope::new(
+                        ErrorCode::ObInvalidRequest,
+                        "idempotency_key already used with different payload",
+                        Some(serde_json::json!({
+                            "reason_code": "OB_IDEMPOTENCY_KEY_REUSE_MISMATCH",
+                            "idempotency_key": key
+                        })),
+                    ));
+                }
+                if let Err(e) = tx.commit().await {
+                    return Envelope::err(ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("commit failed: {e}"),
+                        None,
+                    ));
+                }
+                let mut object_ids = row.object_ids;
+                if object_ids.len() > RECEIPT_OBJECT_IDS_CAP {
+                    object_ids.truncate(RECEIPT_OBJECT_IDS_CAP);
+                }
+                return Envelope::ok(PutObjectsResponse {
+                    results: row.results_json.0,
+                    replayed: true,
+                    request_id: Some(row.request_hash),
+                    accepted_count: row.accepted_count.max(0) as usize,
+                    object_ids,
+                    receipt_hash: Some(row.receipt_hash),
+                });
+            }
+
+            idempotency_scope = Some(scope);
+            idempotency_key = Some(key.to_string());
+            request_hash = Some(computed_request_hash);
+        }
+
+        let mut results = Vec::with_capacity(validated_objects.len());
+        for validated in &validated_objects {
             let actor = validated
                 .provenance
                 .get("actor")
@@ -1401,7 +1592,7 @@ impl Store for PgStore {
                 .map(|_| value_hash_v01(&validated.data));
 
             let version =
-                match Self::upsert_object(&mut tx, &validated, expires_at, value_hash).await {
+                match Self::upsert_object(&mut tx, validated, expires_at, value_hash).await {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = tx.rollback().await;
@@ -1434,11 +1625,50 @@ impl Store for PgStore {
             }
 
             results.push(PutResult {
-                r#ref: validated.id,
-                object_type: validated.object_type,
-                status: validated.status,
+                r#ref: validated.id.clone(),
+                object_type: validated.object_type.clone(),
+                status: validated.status.clone(),
                 version,
             });
+        }
+
+        let mut response = make_put_response(results, false, request_hash.clone(), None);
+        let receipt_hash = compute_receipt_hash(
+            request_hash.as_deref().unwrap_or(""),
+            response.accepted_count,
+            &response.object_ids,
+            &response.results,
+        );
+        response.receipt_hash = Some(receipt_hash.clone());
+
+        if let (Some(scope), Some(key), Some(req_hash)) =
+            (idempotency_scope, idempotency_key, request_hash)
+        {
+            let accepted_count = response.accepted_count as i64;
+            let object_ids = response.object_ids.clone();
+            let results_json = sqlx::types::Json(response.results.clone());
+            if let Err(e) = sqlx::query(
+                r#"INSERT INTO ob_idempotency
+                   (scope, idempotency_key, request_hash, receipt_hash, accepted_count, object_ids, results_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(scope)
+            .bind(key)
+            .bind(req_hash)
+            .bind(receipt_hash)
+            .bind(accepted_count)
+            .bind(object_ids)
+            .bind(results_json)
+            .execute(&mut *tx)
+            .await
+            {
+                let _ = tx.rollback().await;
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("idempotency ledger insert failed: {e}"),
+                    None,
+                ));
+            }
         }
 
         if let Err(e) = tx.commit().await {
@@ -1449,7 +1679,7 @@ impl Store for PgStore {
             ));
         }
 
-        Envelope::ok(PutObjectsResponse { results })
+        Envelope::ok(response)
     }
 
     async fn get_objects(&self, req: GetObjectsRequest) -> Envelope<GetObjectsResponse> {

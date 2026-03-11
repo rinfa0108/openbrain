@@ -28,6 +28,16 @@ pub struct PutResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PutObjectsResponse {
     pub results: Vec<PutResult>,
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub accepted_count: usize,
+    #[serde(default)]
+    pub object_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
