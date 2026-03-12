@@ -2,6 +2,9 @@ use openbrain_core::{Envelope, ErrorCode, ErrorEnvelope, LifecycleState, MemoryO
 use openbrain_store::{GetObjectsRequest, SearchStructuredRequest, Store, WorkspaceRole};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
+
+use crate::service;
 
 const POLICY_KIND: &str = "policy.rule";
 const RETENTION_KIND: &str = "policy.retention";
@@ -461,6 +464,95 @@ pub fn deny_error_with_rule(
             "details": details.unwrap_or(Value::Null)
         })),
     )
+}
+
+pub fn filter_memory_pack_response(
+    resp: Envelope<service::MemoryPackResponse>,
+    rules: &[PolicyRule],
+    identity_id: &str,
+    role: WorkspaceRole,
+) -> Envelope<service::MemoryPackResponse> {
+    let Envelope::Ok { mut data, .. } = resp else {
+        return resp;
+    };
+
+    let mut first_denied: Option<(String, Option<String>)> = None;
+    data.pack.items.retain(|item| {
+        let decision = evaluate(
+            rules,
+            &EvalInput {
+                identity_id,
+                role,
+                operation: PolicyOperation::MemoryPack,
+                object_kind: Some(item.object_type.as_str()),
+                memory_key: item.memory_key.as_deref(),
+                lifecycle_transition: None,
+            },
+        );
+        if decision.allowed {
+            true
+        } else {
+            if first_denied.is_none() {
+                first_denied = Some((
+                    decision
+                        .reason_code
+                        .unwrap_or_else(|| "OB_POLICY_DENY".to_string()),
+                    decision.policy_rule_id,
+                ));
+            }
+            false
+        }
+    });
+
+    if data.pack.items.is_empty() {
+        if let Some((reason_code, policy_rule_id)) = first_denied {
+            return Envelope::err(deny_error_with_rule(
+                &reason_code,
+                policy_rule_id.as_deref(),
+                Some(serde_json::json!({"operation":"memory_pack","phase":"item_filter"})),
+            ));
+        }
+    }
+
+    data.pack.items_selected = data.pack.items.len() as u32;
+    data.pack.relevant = data.pack.items.iter().map(|i| i.id.clone()).collect();
+    data.pack.canonical = data
+        .pack
+        .items
+        .iter()
+        .filter(|i| i.object_type == "decision")
+        .map(|i| i.id.clone())
+        .collect();
+
+    let surviving_keys: BTreeSet<String> = data
+        .pack
+        .items
+        .iter()
+        .filter_map(|i| i.memory_key.clone())
+        .collect();
+    data.pack
+        .conflict_alerts
+        .retain(|a| surviving_keys.contains(&a.memory_key));
+    data.pack.conflicts = data
+        .pack
+        .conflict_alerts
+        .iter()
+        .map(|a| a.memory_key.clone())
+        .collect();
+    data.pack.text = service::render_pack_text(
+        &data.pack.scope,
+        data.pack.budget_requested,
+        &data.pack.items,
+    );
+    data.pack.budget_used =
+        service::estimate_pack_text_tokens(&data.pack.text).min(data.pack.budget_requested);
+    data.pack.summary = format!(
+        "Selected {} items within {} token budget.",
+        data.pack.items.len(),
+        data.pack.budget_requested
+    );
+
+    Envelope::ok(data)
 }
 
 pub fn clamp_u32(requested: Option<u32>, max_value: Option<u32>) -> Option<u32> {

@@ -1071,3 +1071,166 @@ async fn http_memory_pack_policy_deny_and_clamp() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn http_memory_pack_drops_denied_items_by_kind() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+    let pool = setup_pool().await.expect("pool");
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner").await;
+    let writer_token = create_token_for_workspace(&pool, &workspace_id, "writer").await;
+    let client = reqwest::Client::new();
+    let base = server.base.clone();
+
+    let deny_decision_kind = json!({
+        "objects": [{
+            "type":"policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status":"canonical",
+            "spec_version":"0.1",
+            "tags":[],
+            "data":{
+                "id":"deny-decision-item-pack",
+                "effect":"deny",
+                "operations":["memory_pack"],
+                "roles":["writer"],
+                "object_kinds":["decision"],
+                "reason":"OB_POLICY_DENY_DECISION_KIND"
+            },
+            "provenance":{"actor":"owner"}
+        }]
+    });
+    let deny_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&deny_decision_kind)
+        .send()
+        .await
+        .expect("policy write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy write json");
+    assert_eq!(deny_write["ok"].as_bool(), Some(true));
+
+    let obj_decision = format!("decision-{}", uuid::Uuid::new_v4());
+    let obj_claim = format!("claim-{}", uuid::Uuid::new_v4());
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects":[
+                {"type":"decision","id":obj_decision,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"topic":"db"},"provenance":{"actor":"writer"},"lifecycle_state":"accepted"},
+                {"type":"claim","id":obj_claim,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"topic":"db"},"provenance":{"actor":"writer"},"lifecycle_state":"accepted"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("object write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("object write json");
+    assert_eq!(write["ok"].as_bool(), Some(true));
+
+    let pack = client
+        .post(format!("{}/v1/memory/pack", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({"scope": workspace_id, "task_hint":"test", "top_k": 10, "semantic": false}))
+        .send()
+        .await
+        .expect("pack")
+        .json::<serde_json::Value>()
+        .await
+        .expect("pack json");
+    assert_eq!(pack["ok"].as_bool(), Some(true));
+    let items = pack["pack"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        items.iter().all(|i| i["type"].as_str() != Some("decision")),
+        "decision items must be filtered by per-item policy"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_memory_pack_all_candidates_denied_returns_forbidden() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+    let pool = setup_pool().await.expect("pool");
+    let (owner_token, workspace_id) = create_workspace_token(&pool, "owner").await;
+    let writer_token = create_token_for_workspace(&pool, &workspace_id, "writer").await;
+    let client = reqwest::Client::new();
+    let base = server.base.clone();
+
+    let deny_claim_kind = json!({
+        "objects": [{
+            "type":"policy.rule",
+            "id": format!("policy-{}", uuid::Uuid::new_v4()),
+            "scope": workspace_id,
+            "status":"canonical",
+            "spec_version":"0.1",
+            "tags":[],
+            "data":{
+                "id":"deny-claim-item-pack",
+                "effect":"deny",
+                "operations":["memory_pack"],
+                "roles":["writer"],
+                "object_kinds":["claim"],
+                "reason":"OB_POLICY_DENY_CLAIM_KIND"
+            },
+            "provenance":{"actor":"owner"}
+        }]
+    });
+    let deny_write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&owner_token)
+        .json(&deny_claim_kind)
+        .send()
+        .await
+        .expect("policy write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("policy write json");
+    assert_eq!(deny_write["ok"].as_bool(), Some(true));
+
+    let obj_claim = format!("claim-{}", uuid::Uuid::new_v4());
+    let write = client
+        .post(format!("{}/v1/write", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({
+            "objects":[
+                {"type":"claim","id":obj_claim,"scope":workspace_id,"status":"draft","spec_version":"0.1","tags":[],"data":{"k":"v"},"provenance":{"actor":"writer"},"lifecycle_state":"accepted"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("object write")
+        .json::<serde_json::Value>()
+        .await
+        .expect("object write json");
+    assert_eq!(write["ok"].as_bool(), Some(true));
+
+    let denied = client
+        .post(format!("{}/v1/memory/pack", base))
+        .bearer_auth(&writer_token)
+        .json(&json!({"scope": workspace_id, "task_hint":"test", "top_k": 10, "semantic": false}))
+        .send()
+        .await
+        .expect("pack denied")
+        .json::<serde_json::Value>()
+        .await
+        .expect("pack denied json");
+    assert_eq!(denied["error"]["code"].as_str(), Some("OB_FORBIDDEN"));
+    assert_eq!(
+        denied["error"]["details"]["reason_code"].as_str(),
+        Some("OB_POLICY_DENY_CLAIM_KIND")
+    );
+    assert!(denied["error"]["details"]["policy_rule_id"].is_string());
+
+    server.shutdown().await;
+}

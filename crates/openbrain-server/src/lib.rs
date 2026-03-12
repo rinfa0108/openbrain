@@ -681,7 +681,10 @@ where
         ));
     }
     let req = service::apply_pack_request_clamps(req, decision.max_top_k);
-    Json(service::build_pack(&state.store, &state.llm, req).await)
+    let pack = service::build_pack(&state.store, &state.llm, req).await;
+    let filtered =
+        policy::filter_memory_pack_response(pack, &policies, &auth.identity_id, auth.role);
+    Json(filtered)
 }
 
 async fn workspace_token_create<S>(

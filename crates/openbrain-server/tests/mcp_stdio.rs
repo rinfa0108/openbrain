@@ -186,6 +186,54 @@ fn mcp_stdio_ping_smoke() {
 }
 
 #[test]
+fn mcp_stdout_remains_json_rpc_only() {
+    let Some(pool) = setup_pool() else {
+        return;
+    };
+    let (token, _workspace_id) = create_workspace_token(&pool, "writer");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openbrain"))
+        .arg("mcp")
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("db url"),
+        )
+        .env("OPENBRAIN_EMBED_PROVIDER", "noop")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn openbrain mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"0","auth_token": token}
+        })
+    )
+    .expect("write initialize");
+    drop(stdin);
+
+    let reader = BufReader::new(stdout);
+    for line in reader.lines().map_while(Result::ok) {
+        assert!(
+            serde_json::from_str::<Value>(&line).is_ok(),
+            "stdout must contain only JSON-RPC frames, got: {line}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn mcp_stdio_requires_auth_for_write() {
     let Some(_pool) = setup_pool() else {
         return;
