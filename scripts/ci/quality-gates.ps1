@@ -8,6 +8,19 @@ function Require-Command {
   }
 }
 
+function Invoke-RequiredCommand {
+  param(
+    [string]$Command,
+    [string[]]$Arguments
+  )
+  & $Command @Arguments
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    Write-Error "Command failed: $Command $($Arguments -join ' ') (exit $exitCode)"
+    exit $exitCode
+  }
+}
+
 Write-Host "== Tool Versions =="
 Require-Command "rustc"
 Require-Command "cargo"
@@ -27,21 +40,22 @@ if (-not $gitleaksCmd) {
   Write-Error "Missing required tool: gitleaks"
   exit 1
 }
-& rustc --version
-& cargo --version
-& cargo deny --version
-& gitleaks version
+$gitleaksExe = if ($gitleaksCmd -is [System.Management.Automation.CommandInfo]) { $gitleaksCmd.Source } else { [string]$gitleaksCmd }
+Invoke-RequiredCommand -Command "rustc" -Arguments @("--version")
+Invoke-RequiredCommand -Command "cargo" -Arguments @("--version")
+Invoke-RequiredCommand -Command "cargo" -Arguments @("deny", "--version")
+Invoke-RequiredCommand -Command $gitleaksExe -Arguments @("version")
 
 Write-Host "== Rust Gates =="
 $env:RUN_OPENAI_LIVE_TESTS = "0"
 $env:RUN_ANTHROPIC_LIVE_TESTS = "0"
-& cargo fmt --all -- --check
-& cargo clippy --all-targets --all-features -- -D warnings
-& cargo test --all --all-features
+Invoke-RequiredCommand -Command "cargo" -Arguments @("fmt", "--all", "--", "--check")
+Invoke-RequiredCommand -Command "cargo" -Arguments @("clippy", "--all-targets", "--all-features", "--", "-D", "warnings")
+Invoke-RequiredCommand -Command "cargo" -Arguments @("test", "--all", "--all-features")
 
 Write-Host "== Dependency Security/Policy =="
-& cargo deny check advisories
-& cargo deny check licenses bans sources
+Invoke-RequiredCommand -Command "cargo" -Arguments @("deny", "check", "advisories")
+Invoke-RequiredCommand -Command "cargo" -Arguments @("deny", "check", "licenses", "bans", "sources")
 
 Write-Host "== Secret Scan =="
-& gitleaks detect --source . --config .gitleaks.toml --no-git
+Invoke-RequiredCommand -Command $gitleaksExe -Arguments @("detect", "--source", ".", "--config", ".gitleaks.toml", "--no-git")
