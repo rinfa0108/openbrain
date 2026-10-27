@@ -863,6 +863,7 @@ async fn run_shadow_command(args: ShadowCommandArgs) -> Result<(), String> {
                     objects: objects.clone(),
                     actor: args.actor.clone(),
                     idempotency_key: None,
+                    expected_versions: std::collections::BTreeMap::new(),
                 })
                 .await;
             let results = match resp {

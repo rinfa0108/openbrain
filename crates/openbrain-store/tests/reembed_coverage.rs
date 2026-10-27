@@ -81,6 +81,7 @@ async fn embedding_coverage_counts_missing_and_present() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -137,6 +138,7 @@ async fn reembed_fills_missing_and_is_idempotent() {
                 .collect(),
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -212,6 +214,7 @@ async fn reembed_respects_lifecycle_state_filter() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -252,6 +255,7 @@ async fn reembed_returns_clear_error_when_provider_unavailable() {
             objects: vec![obj_claim(&id, &scope, Some(LifecycleState::Accepted))],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -301,6 +305,7 @@ async fn reembed_dry_run_does_not_write_embeddings() {
             objects: vec![obj_claim(&id, &scope, Some(LifecycleState::Accepted))],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -357,6 +362,7 @@ async fn reembed_surfaces_event_append_failure() {
             objects: vec![obj_claim(&id, &scope, Some(LifecycleState::Accepted))],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 

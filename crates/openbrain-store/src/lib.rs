@@ -6,6 +6,7 @@ use openbrain_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub use pg::{hash_token, PgStore};
 
@@ -16,6 +17,10 @@ pub struct PutObjectsRequest {
     pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Expected current versions keyed by object id. A missing entry means
+    /// create-only for new objects and an unconditional update is rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected_versions: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

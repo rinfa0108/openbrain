@@ -128,6 +128,7 @@ async fn structured_search_filters_and_restricts_scope() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -188,6 +189,7 @@ async fn structured_search_filters_by_nested_data() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -344,6 +346,7 @@ async fn structured_search_defaults_to_accepted_and_not_expired() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -420,6 +423,7 @@ async fn structured_search_include_states_and_expired_override() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -473,6 +477,7 @@ async fn structured_search_promotion_changes_visibility() {
             )],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -509,6 +514,7 @@ async fn structured_search_promotion_changes_visibility() {
             )],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -574,6 +580,7 @@ async fn structured_search_conflict_detection() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -648,6 +655,7 @@ async fn structured_search_conflict_resolution_persists_and_clears_default_confl
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -682,6 +690,7 @@ async fn structured_search_conflict_resolution_persists_and_clears_default_confl
             objects: vec![winner, loser],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 

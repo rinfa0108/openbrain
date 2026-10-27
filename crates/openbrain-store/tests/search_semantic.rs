@@ -95,6 +95,7 @@ async fn seed_object_and_embedding(store: &PgStore, scope: &str, id: &str, objec
             objects: vec![object],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -280,6 +281,7 @@ async fn semantic_search_top_k_is_capped_to_50() {
             objects,
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -386,6 +388,7 @@ async fn semantic_search_respects_embedding_provider_selection() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -505,6 +508,7 @@ async fn semantic_search_respects_embedding_model_selection() {
             ],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
