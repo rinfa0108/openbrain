@@ -64,6 +64,7 @@ async fn roundtrip_write_read() {
             objects: vec![valid_object(&id, &scope, "0.1")],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -120,6 +121,7 @@ async fn insert_sets_version_1() {
             objects: vec![valid_object(&id, &scope, "0.1")],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -144,6 +146,7 @@ async fn update_increments_version() {
             objects: vec![valid_object(&id, &scope, "0.1")],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -161,6 +164,7 @@ async fn update_increments_version() {
             objects: vec![updated],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::from([(id.clone(), 1)]),
         })
         .await;
 
@@ -168,6 +172,89 @@ async fn update_increments_version() {
         Envelope::Ok { data, .. } => assert_eq!(data.results[0].version, 2),
         Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
     }
+}
+
+#[tokio::test]
+async fn cas_rejects_stale_and_cross_scope_writes_and_preserves_history() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+    let store = PgStore::from_pool(pool.clone());
+    let scope = format!("test-{}", Uuid::new_v4());
+    let other_scope = format!("test-{}", Uuid::new_v4());
+    let id = format!("obj-{}", Uuid::new_v4());
+
+    let first = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![valid_object(&id, &scope, "0.1")],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(first, Envelope::Ok { .. }));
+
+    let mut current = valid_object(&id, &scope, "0.1");
+    current.data = Some(serde_json::json!({"k":"current"}));
+    let current_write = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![current],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::from([(id.clone(), 1)]),
+        })
+        .await;
+    assert!(matches!(current_write, Envelope::Ok { .. }));
+
+    let mut stale = valid_object(&id, &scope, "0.1");
+    stale.data = Some(serde_json::json!({"k":"stale"}));
+    match store
+        .put_objects(PutObjectsRequest {
+            objects: vec![stale],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::from([(id.clone(), 1)]),
+        })
+        .await
+    {
+        Envelope::Err { error, .. } => {
+            assert_eq!(error.code, "OB_CONFLICT");
+            assert_eq!(
+                error.details.as_ref().and_then(|v| v.get("reason_code")),
+                Some(&serde_json::json!("OB_EXPECTED_VERSION_MISMATCH"))
+            );
+        }
+        Envelope::Ok { .. } => panic!("stale write was accepted"),
+    }
+
+    let cross_scope = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![valid_object(&id, &other_scope, "0.1")],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::from([(id.clone(), 2)]),
+        })
+        .await;
+    match cross_scope {
+        Envelope::Err { error, .. } => {
+            assert_eq!(error.code, "OB_CONFLICT");
+            assert_eq!(
+                error.details.as_ref().and_then(|v| v.get("reason_code")),
+                Some(&serde_json::json!("OB_SCOPE_ID_COLLISION"))
+            );
+        }
+        Envelope::Ok { .. } => panic!("cross-scope collision was accepted"),
+    }
+
+    let history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ob_object_versions WHERE object_id = $1 AND scope = $2",
+    )
+    .bind(&id)
+    .bind(&scope)
+    .fetch_one(&pool)
+    .await
+    .expect("count object history");
+    assert_eq!(history_count, 1);
 }
 
 #[tokio::test]
@@ -185,6 +272,7 @@ async fn write_appends_event() {
             objects: vec![valid_object(&id, &scope, "0.1")],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -222,6 +310,7 @@ async fn invalid_object_missing_required_field_fails_with_invalid_schema() {
             objects: vec![obj],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -248,6 +337,7 @@ async fn wrong_spec_version_fails_with_unsupported_version() {
             objects: vec![obj],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 

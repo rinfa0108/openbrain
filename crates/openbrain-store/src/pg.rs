@@ -586,9 +586,10 @@ impl PgStore {
         obj: &ValidatedMemoryObject,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
         value_hash: Option<String>,
+        expected_version: Option<i64>,
     ) -> Result<i64, ErrorEnvelope> {
         let existing = sqlx::query(
-            r#"SELECT version
+            r#"SELECT scope, version
                FROM ob_objects
                WHERE id = $1
                FOR UPDATE"#,
@@ -606,6 +607,17 @@ impl PgStore {
 
         match existing {
             None => {
+                if expected_version.is_some() {
+                    return Err(ErrorEnvelope::new(
+                        ErrorCode::ObConflict,
+                        "expected version supplied for missing object",
+                        Some(serde_json::json!({
+                            "reason_code": "OB_EXPECTED_VERSION_MISSING",
+                            "object_id": obj.id,
+                            "expected_version": expected_version,
+                        })),
+                    ));
+                }
                 let version: i64 = sqlx::query_scalar(
                     r#"INSERT INTO ob_objects
                        (id, scope, type, status, spec_version, tags, data, provenance, version,
@@ -645,6 +657,13 @@ impl PgStore {
                 Ok(version)
             }
             Some(row) => {
+                let current_scope: String = row.try_get("scope").map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("object scope read failed: {e}"),
+                        None,
+                    )
+                })?;
                 let current_version: i64 = row.try_get("version").map_err(|e| {
                     ErrorEnvelope::new(
                         ErrorCode::ObStorageError,
@@ -652,31 +671,76 @@ impl PgStore {
                         None,
                     )
                 })?;
+                if current_scope != obj.scope {
+                    return Err(ErrorEnvelope::new(
+                        ErrorCode::ObConflict,
+                        "object id already belongs to another scope",
+                        Some(serde_json::json!({
+                            "reason_code": "OB_SCOPE_ID_COLLISION",
+                            "object_id": obj.id,
+                            "existing_scope": current_scope,
+                            "requested_scope": obj.scope,
+                        })),
+                    ));
+                }
+                if expected_version != Some(current_version) {
+                    return Err(ErrorEnvelope::new(
+                        ErrorCode::ObConflict,
+                        "expected version does not match current object version",
+                        Some(serde_json::json!({
+                            "reason_code": "OB_EXPECTED_VERSION_MISMATCH",
+                            "object_id": obj.id,
+                            "expected_version": expected_version,
+                            "current_version": current_version,
+                        })),
+                    ));
+                }
                 let new_version = current_version + 1;
+                sqlx::query(
+                    r#"INSERT INTO ob_object_versions
+                       (object_id, scope, version, type, status, spec_version, tags, data,
+                        provenance, lifecycle_state, expires_at, memory_key, value_hash,
+                        conflict_status, resolved_by_object_id, resolved_at, resolution_note)
+                       SELECT id, scope, version, type, status, spec_version, tags, data,
+                              provenance, lifecycle_state, expires_at, memory_key, value_hash,
+                              conflict_status, resolved_by_object_id, resolved_at, resolution_note
+                       FROM ob_objects
+                       WHERE id = $1"#,
+                )
+                .bind(&obj.id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| {
+                    ErrorEnvelope::new(
+                        ErrorCode::ObStorageError,
+                        format!("object history insert failed: {e}"),
+                        None,
+                    )
+                })?;
                 let version: i64 = sqlx::query_scalar(
                     r#"UPDATE ob_objects
-                       SET scope = $2,
-                           type = $3,
-                           status = $4,
-                           spec_version = $5,
-                           tags = $6,
-                           data = $7,
-                           provenance = $8,
-                           version = $9,
-                           lifecycle_state = $10,
-                           expires_at = $11,
-                           memory_key = $12,
-                           value_hash = $13,
-                           conflict_status = $14,
-                           resolved_by_object_id = $15,
-                           resolved_at = $16,
-                           resolution_note = $17,
+                       SET type = $2,
+                           status = $3,
+                           spec_version = $4,
+                           tags = $5,
+                           data = $6,
+                           provenance = $7,
+                           version = $8,
+                           lifecycle_state = $9,
+                           expires_at = $10,
+                           memory_key = $11,
+                           value_hash = $12,
+                           conflict_status = $13,
+                           resolved_by_object_id = $14,
+                           resolved_at = $15,
+                           resolution_note = $16,
                            updated_at = now()
                        WHERE id = $1
+                         AND scope = $17
+                         AND version = $18
                        RETURNING version"#,
                 )
                 .bind(&obj.id)
-                .bind(&obj.scope)
                 .bind(&obj.object_type)
                 .bind(&obj.status)
                 .bind(&obj.spec_version)
@@ -695,6 +759,8 @@ impl PgStore {
                     obj.resolved_at.as_deref(),
                 )?)
                 .bind(obj.resolution_note.as_deref())
+                .bind(&obj.scope)
+                .bind(current_version)
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|e| {
@@ -800,6 +866,7 @@ fn compute_request_hash(
     scope: &str,
     actor: Option<&str>,
     objects: &[ValidatedMemoryObject],
+    expected_versions: &std::collections::BTreeMap<String, i64>,
 ) -> String {
     let canonical_objects: Vec<Value> = objects
         .iter()
@@ -827,6 +894,7 @@ fn compute_request_hash(
         "scope": scope,
         "actor": actor.map(str::trim).filter(|v| !v.is_empty()),
         "objects": canonical_objects,
+        "expected_versions": expected_versions,
     }));
     let payload = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -1510,8 +1578,12 @@ impl Store for PgStore {
                 ));
             }
 
-            let computed_request_hash =
-                compute_request_hash(&scope, req.actor.as_deref(), &validated_objects);
+            let computed_request_hash = compute_request_hash(
+                &scope,
+                req.actor.as_deref(),
+                &validated_objects,
+                &req.expected_versions,
+            );
 
             let existing: Option<IdempotencyRow> = match sqlx::query_as(
                 r#"SELECT request_hash, receipt_hash, accepted_count, object_ids, results_json
@@ -1599,8 +1671,15 @@ impl Store for PgStore {
                 .as_ref()
                 .map(|_| value_hash_v01(&validated.data));
 
-            let version =
-                match Self::upsert_object(&mut tx, validated, expires_at, value_hash).await {
+            let version = match Self::upsert_object(
+                &mut tx,
+                validated,
+                expires_at,
+                value_hash,
+                req.expected_versions.get(&validated.id).copied(),
+            )
+            .await
+            {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = tx.rollback().await;
@@ -2935,7 +3014,8 @@ impl AuthStore for PgStore {
             )
         })?;
 
-        let has_tokens: Option<i64> = sqlx::query_scalar("SELECT 1 FROM ob_tokens LIMIT 1")
+        let has_tokens: Option<i64> =
+            sqlx::query_scalar("SELECT 1::BIGINT FROM ob_tokens LIMIT 1")
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| {

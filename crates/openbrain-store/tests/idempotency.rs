@@ -63,6 +63,7 @@ async fn write_with_idempotency_key_is_replayed() {
         objects: vec![mk_object(&id, &scope, "a")],
         actor: Some("writer".to_string()),
         idempotency_key: Some(key),
+        expected_versions: std::collections::BTreeMap::new(),
     };
 
     let first = store.put_objects(req.clone()).await;
@@ -118,11 +119,13 @@ async fn idempotency_key_mismatch_rejected() {
         objects: vec![mk_object(&id, &scope, "a")],
         actor: Some("writer".to_string()),
         idempotency_key: Some(key.clone()),
+        expected_versions: std::collections::BTreeMap::new(),
     };
     let second = PutObjectsRequest {
         objects: vec![mk_object(&id, &scope, "b")],
         actor: Some("writer".to_string()),
         idempotency_key: Some(key),
+        expected_versions: std::collections::BTreeMap::new(),
     };
 
     match store.put_objects(first).await {
@@ -162,6 +165,7 @@ async fn idempotency_is_workspace_scoped() {
             objects: vec![mk_object(&id_a, &scope_a, "a")],
             actor: Some("writer".to_string()),
             idempotency_key: Some(key.clone()),
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
     let b = store
@@ -169,6 +173,7 @@ async fn idempotency_is_workspace_scoped() {
             objects: vec![mk_object(&id_b, &scope_b, "a")],
             actor: Some("writer".to_string()),
             idempotency_key: Some(key),
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -207,6 +212,7 @@ async fn bounded_object_ids_receipt_cap() {
             objects,
             actor: Some("writer".to_string()),
             idempotency_key: Some(key),
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -233,6 +239,7 @@ async fn ledger_persists_across_new_connection() {
         objects: vec![mk_object(&id, &scope, "p")],
         actor: Some("writer".to_string()),
         idempotency_key: Some(key),
+        expected_versions: std::collections::BTreeMap::new(),
     };
 
     let store_a = PgStore::from_pool(pool);

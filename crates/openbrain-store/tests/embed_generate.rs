@@ -214,6 +214,7 @@ async fn embed_generate_allows_multiple_providers_for_same_object() {
             objects: vec![obj_claim(&id, &scope)],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -263,6 +264,7 @@ async fn embed_generate_allows_multiple_models_for_same_object() {
             objects: vec![obj_claim(&id, &scope)],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
@@ -330,6 +332,7 @@ async fn embed_generate_ref_stores_object_id() {
             objects: vec![obj_claim(&id, &scope)],
             actor: None,
             idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
 
