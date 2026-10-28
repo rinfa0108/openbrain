@@ -8,6 +8,9 @@ async fn setup_pool() -> Option<PgPool> {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(v) => v,
         Err(_) => {
+            if std::env::var("OPENBRAIN_REQUIRE_DATABASE_TESTS").as_deref() == Ok("1") {
+                panic!("DATABASE_URL is required when OPENBRAIN_REQUIRE_DATABASE_TESTS=1");
+            }
             eprintln!(
                 "skipping postgres-backed tests: set DATABASE_URL (example: postgres://postgres:postgres@localhost:5432/postgres)"
             );

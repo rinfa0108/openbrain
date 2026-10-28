@@ -44,3 +44,23 @@ DROP TRIGGER IF EXISTS ob_objects_scope_immutable ON ob_objects;
 CREATE TRIGGER ob_objects_scope_immutable
 BEFORE UPDATE OF scope ON ob_objects
 FOR EACH ROW EXECUTE FUNCTION ob_reject_scope_change();
+
+CREATE OR REPLACE FUNCTION ob_reject_object_version_history_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'object version history is append-only'
+    USING ERRCODE = 'read_only_sql_transaction';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS ob_object_versions_no_update ON ob_object_versions;
+CREATE TRIGGER ob_object_versions_no_update
+BEFORE UPDATE ON ob_object_versions
+FOR EACH ROW EXECUTE FUNCTION ob_reject_object_version_history_mutation();
+
+DROP TRIGGER IF EXISTS ob_object_versions_no_delete ON ob_object_versions;
+CREATE TRIGGER ob_object_versions_no_delete
+BEFORE DELETE ON ob_object_versions
+FOR EACH ROW EXECUTE FUNCTION ob_reject_object_version_history_mutation();

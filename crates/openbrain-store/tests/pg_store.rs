@@ -8,6 +8,9 @@ async fn setup_pool() -> Option<PgPool> {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(v) => v,
         Err(_) => {
+            if std::env::var("OPENBRAIN_REQUIRE_DATABASE_TESTS").as_deref() == Ok("1") {
+                panic!("DATABASE_URL is required when OPENBRAIN_REQUIRE_DATABASE_TESTS=1");
+            }
             eprintln!(
                 "skipping postgres-backed tests: set DATABASE_URL (example: postgres://postgres:postgres@localhost:5432/postgres)"
             );
@@ -238,12 +241,38 @@ async fn cas_rejects_stale_and_cross_scope_writes_and_preserves_history() {
     match cross_scope {
         Envelope::Err { error, .. } => {
             assert_eq!(error.code, "OB_CONFLICT");
+            assert!(error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("existing_scope"))
+                .is_none());
             assert_eq!(
                 error.details.as_ref().and_then(|v| v.get("reason_code")),
                 Some(&serde_json::json!("OB_SCOPE_ID_COLLISION"))
             );
         }
         Envelope::Ok { .. } => panic!("cross-scope collision was accepted"),
+    }
+
+    let mut omitted_expected = valid_object(&id, &scope, "0.1");
+    omitted_expected.data = Some(serde_json::json!({"k":"unconditional"}));
+    match store
+        .put_objects(PutObjectsRequest {
+            objects: vec![omitted_expected],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
+        })
+        .await
+    {
+        Envelope::Err { error, .. } => {
+            assert_eq!(error.code, "OB_CONFLICT");
+            assert_eq!(
+                error.details.as_ref().and_then(|v| v.get("reason_code")),
+                Some(&serde_json::json!("OB_EXPECTED_VERSION_MISMATCH"))
+            );
+        }
+        Envelope::Ok { .. } => panic!("unconditional existing-object update was accepted"),
     }
 
     let history_count: i64 = sqlx::query_scalar(
@@ -255,6 +284,104 @@ async fn cas_rejects_stale_and_cross_scope_writes_and_preserves_history() {
     .await
     .expect("count object history");
     assert_eq!(history_count, 1);
+
+    let direct_scope_update = sqlx::query("UPDATE ob_objects SET scope = $2 WHERE id = $1")
+        .bind(&id)
+        .bind(&other_scope)
+        .execute(&pool)
+        .await;
+    assert!(
+        direct_scope_update.is_err(),
+        "direct scope mutation was accepted"
+    );
+
+    let direct_history_update = sqlx::query(
+        "UPDATE ob_object_versions SET status = 'tampered' WHERE object_id = $1 AND version = 1",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await;
+    assert!(
+        direct_history_update.is_err(),
+        "direct history update was accepted"
+    );
+
+    let direct_history_delete =
+        sqlx::query("DELETE FROM ob_object_versions WHERE object_id = $1 AND version = 1")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+    assert!(
+        direct_history_delete.is_err(),
+        "direct history delete was accepted"
+    );
+}
+
+#[tokio::test]
+async fn failed_batch_rolls_back_prior_object_updates() {
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+    let store = PgStore::from_pool(pool.clone());
+    let scope = format!("test-{}", Uuid::new_v4());
+    let first_id = format!("obj-{}", Uuid::new_v4());
+    let second_id = format!("obj-{}", Uuid::new_v4());
+
+    let initial = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![
+                valid_object(&first_id, &scope, "0.1"),
+                valid_object(&second_id, &scope, "0.1"),
+            ],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(initial, Envelope::Ok { .. }));
+
+    let mut first_update = valid_object(&first_id, &scope, "0.1");
+    first_update.data = Some(serde_json::json!({"k":"should-rollback"}));
+    let mut second_update = valid_object(&second_id, &scope, "0.1");
+    second_update.data = Some(serde_json::json!({"k":"should-fail"}));
+    let failed = store
+        .put_objects(PutObjectsRequest {
+            objects: vec![first_update, second_update],
+            actor: None,
+            idempotency_key: None,
+            expected_versions: std::collections::BTreeMap::from([
+                (first_id.clone(), 1),
+                (second_id.clone(), 0),
+            ]),
+        })
+        .await;
+    assert!(matches!(failed, Envelope::Err { .. }));
+
+    let current = store
+        .get_objects(GetObjectsRequest {
+            scope: scope.clone(),
+            refs: vec![first_id.clone()],
+            include_states: None,
+            include_expired: None,
+            include_conflicts: None,
+            now: None,
+        })
+        .await;
+    match current {
+        Envelope::Ok { data, .. } => {
+            assert_eq!(data.objects[0].version, 1);
+            assert_eq!(data.objects[0].data, serde_json::json!({"k":"v"}));
+        }
+        Envelope::Err { error, .. } => panic!("unexpected read error: {}", error.code),
+    }
+
+    let history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ob_object_versions WHERE object_id = $1")
+            .bind(&first_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rolled-back history");
+    assert_eq!(history_count, 0);
 }
 
 #[tokio::test]

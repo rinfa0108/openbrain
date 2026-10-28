@@ -678,7 +678,6 @@ impl PgStore {
                         Some(serde_json::json!({
                             "reason_code": "OB_SCOPE_ID_COLLISION",
                             "object_id": obj.id,
-                            "existing_scope": current_scope,
                             "requested_scope": obj.scope,
                         })),
                     ));
@@ -857,7 +856,7 @@ struct ConflictInfo {
 struct IdempotencyRow {
     request_hash: String,
     receipt_hash: String,
-    accepted_count: i64,
+    accepted_count: i32,
     object_ids: Vec<String>,
     results_json: sqlx::types::Json<Vec<PutResult>>,
 }
@@ -1141,18 +1140,18 @@ fn build_pred(qb: &mut QueryBuilder<'_, Postgres>, pred: &Predicate) -> Result<(
                     )),
                 },
                 (FieldType::JsonText, Literal::Number(n)) => {
-                    qb.push("(");
+                    qb.push("((");
                     qb.push(field_sql);
-                    qb.push("::double precision");
+                    qb.push(")::double precision");
                     push_cmp_op(qb, *op);
                     qb.push_bind(*n);
                     qb.push(")");
                     Ok(())
                 }
                 (FieldType::JsonText, Literal::Bool(b)) => {
-                    qb.push("(");
+                    qb.push("((");
                     qb.push(field_sql);
-                    qb.push("::boolean");
+                    qb.push(")::boolean");
                     push_cmp_op(qb, *op);
                     qb.push_bind(*b);
                     qb.push(")");
@@ -1411,18 +1410,18 @@ fn build_pred_with_alias(
                     )),
                 },
                 (FieldType::JsonText, Literal::Number(n)) => {
-                    qb.push("(");
+                    qb.push("((");
                     qb.push(field_sql);
-                    qb.push("::double precision");
+                    qb.push(")::double precision");
                     push_cmp_op(qb, *op);
                     qb.push_bind(*n);
                     qb.push(")");
                     Ok(())
                 }
                 (FieldType::JsonText, Literal::Bool(b)) => {
-                    qb.push("(");
+                    qb.push("((");
                     qb.push(field_sql);
-                    qb.push("::boolean");
+                    qb.push(")::boolean");
                     push_cmp_op(qb, *op);
                     qb.push_bind(*b);
                     qb.push(")");
@@ -1680,12 +1679,12 @@ impl Store for PgStore {
             )
             .await
             {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        return Envelope::err(e);
-                    }
-                };
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Envelope::err(e);
+                }
+            };
 
             let payload = serde_json::json!({
                 "ref": validated.id,
@@ -1789,16 +1788,11 @@ impl Store for PgStore {
         if include_states.is_empty() {
             return Envelope::ok(GetObjectsResponse { objects: vec![] });
         }
-        let include_expired = req.include_expired.unwrap_or(false);
+        let _include_expired = req.include_expired.unwrap_or(false);
         let now = match Self::parse_datetime_opt("now", req.now.as_deref()) {
             Ok(Some(v)) => v,
             Ok(None) => chrono::Utc::now(),
             Err(e) => return Envelope::err(e),
-        };
-        let now = if include_expired {
-            chrono::DateTime::<chrono::Utc>::MIN_UTC
-        } else {
-            now
         };
         let state_strings = Self::to_state_strings(&include_states);
 
@@ -1942,11 +1936,6 @@ impl Store for PgStore {
             Ok(None) => chrono::Utc::now(),
             Err(e) => return Envelope::err(e),
         };
-        let now = if include_expired {
-            chrono::DateTime::<chrono::Utc>::MIN_UTC
-        } else {
-            now
-        };
         let state_strings = Self::to_state_strings(&include_states);
         let include_conflicts = include_conflicts_enabled(req.include_conflicts);
 
@@ -1973,9 +1962,11 @@ impl Store for PgStore {
         qb.push(" AND lifecycle_state = ANY(");
         qb.push_bind(state_strings.clone());
         qb.push(")");
-        qb.push(" AND (expires_at IS NULL OR expires_at > ");
-        qb.push_bind(now);
-        qb.push(")");
+        if !include_expired {
+            qb.push(" AND (expires_at IS NULL OR expires_at > ");
+            qb.push_bind(now);
+            qb.push(")");
+        }
 
         if let Some(e) = &expr {
             qb.push(" AND ");
@@ -2312,16 +2303,11 @@ impl Store for PgStore {
         if include_states.is_empty() {
             return Envelope::ok(SearchSemanticResponse { matches: vec![] });
         }
-        let include_expired = req.include_expired.unwrap_or(false);
+        let _include_expired = req.include_expired.unwrap_or(false);
         let now = match Self::parse_datetime_opt("now", req.now.as_deref()) {
             Ok(Some(v)) => v,
             Ok(None) => chrono::Utc::now(),
             Err(e) => return Envelope::err(e),
-        };
-        let now = if include_expired {
-            chrono::DateTime::<chrono::Utc>::MIN_UTC
-        } else {
-            now
         };
         let state_strings = Self::to_state_strings(&include_states);
         let include_conflicts = include_conflicts_enabled(req.include_conflicts);
@@ -2336,39 +2322,17 @@ impl Store for PgStore {
         let kind = Self::normalize_opt_field(req.embedding_kind.as_deref())
             .unwrap_or_else(|| self.embedding_kind.clone());
 
-        let has_embeddings: Option<i64> = match sqlx::query_scalar(
-            r#"SELECT 1
-               FROM ob_embeddings
-               WHERE scope = $1
-                 AND provider = $2
-                 AND model = $3
-                 AND kind = $4
-               LIMIT 1"#,
-        )
-        .bind(&req.scope)
-        .bind(&provider)
-        .bind(&model)
-        .bind(&kind)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Envelope::err(ErrorEnvelope::new(
-                    ErrorCode::ObStorageError,
-                    format!("semantic search failed: {e}"),
-                    None,
-                ));
-            }
-        };
-
-        if has_embeddings.is_none() {
-            return Envelope::ok(SearchSemanticResponse { matches: vec![] });
-        }
-
         let normalized_query = match validate_embedding_text(&req.query, MAX_EMBED_TEXT_LEN) {
             Ok(v) => v,
             Err(e) => return Envelope::err(e),
+        };
+
+        let expr = match req.filters.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s) => match parse_where(s) {
+                Ok(e) => Some(e),
+                Err(err) => return Envelope::err(err),
+            },
         };
 
         let embedding = match self.embedder.embed(&model, &normalized_query).await {
@@ -2401,17 +2365,39 @@ impl Store for PgStore {
             ));
         }
 
+        let has_embeddings: Option<i64> = match sqlx::query_scalar(
+            r#"SELECT 1::BIGINT
+               FROM ob_embeddings
+               WHERE scope = $1
+                 AND provider = $2
+                 AND model = $3
+                 AND kind = $4
+               LIMIT 1"#,
+        )
+        .bind(&req.scope)
+        .bind(&provider)
+        .bind(&model)
+        .bind(&kind)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Envelope::err(ErrorEnvelope::new(
+                    ErrorCode::ObStorageError,
+                    format!("semantic search failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        if has_embeddings.is_none() {
+            return Envelope::ok(SearchSemanticResponse { matches: vec![] });
+        }
+
         let vector_text = match embedding_to_pgvector_literal(&embedding) {
             Ok(v) => v,
             Err(e) => return Envelope::err(e),
-        };
-
-        let expr = match req.filters.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(s) => match parse_where(s) {
-                Ok(e) => Some(e),
-                Err(err) => return Envelope::err(err),
-            },
         };
 
         let mut qb = QueryBuilder::<Postgres>::new(
@@ -3014,8 +3000,7 @@ impl AuthStore for PgStore {
             )
         })?;
 
-        let has_tokens: Option<i64> =
-            sqlx::query_scalar("SELECT 1::BIGINT FROM ob_tokens LIMIT 1")
+        let has_tokens: Option<i64> = sqlx::query_scalar("SELECT 1::BIGINT FROM ob_tokens LIMIT 1")
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| {
