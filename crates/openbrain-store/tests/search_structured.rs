@@ -10,6 +10,9 @@ async fn setup_pool() -> Option<PgPool> {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(v) => v,
         Err(_) => {
+            if std::env::var("OPENBRAIN_REQUIRE_DATABASE_TESTS").as_deref() == Ok("1") {
+                panic!("DATABASE_URL is required when OPENBRAIN_REQUIRE_DATABASE_TESTS=1");
+            }
             eprintln!(
                 "skipping postgres-backed tests: set DATABASE_URL (example: postgres://postgres:postgres@localhost:5432/postgres)"
             );
@@ -449,7 +452,7 @@ async fn structured_search_include_states_and_expired_override() {
             expected.sort();
             assert_eq!(refs, expected);
         }
-        Envelope::Err { error, .. } => panic!("unexpected error: {}", error.code),
+        Envelope::Err { error, .. } => panic!("unexpected error: {:?}", error),
     }
 }
 
@@ -514,7 +517,7 @@ async fn structured_search_promotion_changes_visibility() {
             )],
             actor: None,
             idempotency_key: None,
-            expected_versions: std::collections::BTreeMap::new(),
+            expected_versions: std::collections::BTreeMap::from([(id.clone(), 1)]),
         })
         .await;
 
@@ -690,7 +693,10 @@ async fn structured_search_conflict_resolution_persists_and_clears_default_confl
             objects: vec![winner, loser],
             actor: None,
             idempotency_key: None,
-            expected_versions: std::collections::BTreeMap::new(),
+            expected_versions: std::collections::BTreeMap::from([
+                (winner_id.clone(), 1),
+                (loser_id.clone(), 1),
+            ]),
         })
         .await;
 
