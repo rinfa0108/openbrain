@@ -37,6 +37,8 @@ Allowlists and policy live in:
 Iteration 0 provides SQL migrations.
 
 - Apply locally (example): `psql "$DATABASE_URL" -f migrations/0001_init.sql`
+- Apply every file in order. There is no runtime migrator, so an existing database only changes when you apply new files to it (see the Operations Runbook).
+- Do not edit a migration that has shipped; add a new numbered file. `migrations_frozen.rs` fails if a frozen file changes. Add a file's hash to its list once it is released.
 
 ## Postgres for tests
 
