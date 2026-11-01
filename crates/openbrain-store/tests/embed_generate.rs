@@ -10,6 +10,9 @@ async fn setup_pool() -> Option<PgPool> {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(v) => v,
         Err(_) => {
+            if std::env::var("OPENBRAIN_REQUIRE_DATABASE_TESTS").as_deref() == Ok("1") {
+                panic!("DATABASE_URL is required when OPENBRAIN_REQUIRE_DATABASE_TESTS=1");
+            }
             eprintln!(
                 "skipping postgres-backed tests: set DATABASE_URL (example: postgres://postgres:postgres@localhost:5432/postgres)"
             );
@@ -257,9 +260,8 @@ async fn embed_generate_allows_multiple_models_for_same_object() {
     let id = format!("obj-{}", Uuid::new_v4());
     let model_a = "fake-v1".to_string();
     let model_b = "fake-v2".to_string();
-    let text = "shared text for model-aware embeddings".to_string();
 
-    let _ = store
+    let seeded = store
         .put_objects(PutObjectsRequest {
             objects: vec![obj_claim(&id, &scope)],
             actor: None,
@@ -267,11 +269,12 @@ async fn embed_generate_allows_multiple_models_for_same_object() {
             expected_versions: std::collections::BTreeMap::new(),
         })
         .await;
+    assert!(matches!(seeded, Envelope::Ok { .. }));
 
     let first = store
         .embed_generate(EmbedGenerateRequest {
             scope: scope.clone(),
-            target: EmbedTarget::Text { text: text.clone() },
+            target: EmbedTarget::Ref { r#ref: id.clone() },
             model: model_a,
             dims: None,
         })
@@ -288,7 +291,7 @@ async fn embed_generate_allows_multiple_models_for_same_object() {
     let second = store
         .embed_generate(EmbedGenerateRequest {
             scope: scope.clone(),
-            target: EmbedTarget::Text { text: text.clone() },
+            target: EmbedTarget::Ref { r#ref: id.clone() },
             model: model_b,
             dims: None,
         })

@@ -14,6 +14,9 @@ async fn setup_pool() -> Option<PgPool> {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(v) => v,
         Err(_) => {
+            if std::env::var("OPENBRAIN_REQUIRE_DATABASE_TESTS").as_deref() == Ok("1") {
+                panic!("DATABASE_URL is required when OPENBRAIN_REQUIRE_DATABASE_TESTS=1");
+            }
             eprintln!(
                 "skipping postgres-backed tests: set DATABASE_URL (example: postgres://postgres:postgres@localhost:5432/postgres)"
             );
@@ -534,8 +537,8 @@ async fn semantic_search_respects_embedding_model_selection() {
         })
         .await;
 
-    let query_a = normalize_object_text("model a", &model_a_data).unwrap();
-    let query_b = normalize_object_text("model b", &model_b_data).unwrap();
+    let query_a = normalize_object_text("decision", &model_a_data).unwrap();
+    let query_b = normalize_object_text("decision", &model_b_data).unwrap();
 
     let res_a = store
         .search_semantic(SearchSemanticRequest {

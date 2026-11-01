@@ -56,7 +56,15 @@ Viewer screenshots:
 
 ## Operations procedures
 ### Migrations
-Migrations run during normal startup/demo flow. Manual SQL steps are not required for standard onboarding.
+Nothing in OpenBrain applies migrations at runtime. The files in `migrations/` are applied only when a database is created: by the Docker Postgres init on an **empty** data volume, or by the test harness. An existing database does not pick up new migrations, and a changed file is never re-run.
+
+To upgrade an existing database, apply each migration newer than the last one it has, in order, as the owning role:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0007_object_version_history_append_only.sql
+```
+
+Migrations from 0006 onward are written to be safe to run twice. Never edit a migration that has been released; add a new numbered file (`crates/openbrain-store/tests/migrations_frozen.rs` enforces this). Migration 0007 makes `ob_object_versions` append-only for the application and ordinary SQL, including `TRUNCATE`; the database owner and superusers can still disable the triggers.
 
 ### Backup and restore
 Use normal Postgres backup strategy (`pg_dump` for logical backup, PITR/physical backup for production). After restore, verify `/v1/ping`, workspace info, and audit queries.
